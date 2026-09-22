@@ -21,6 +21,7 @@ frontend/dist/
 # Env & secrets
 .env
 .env.*
+!.env.example
 CLIPPER_SECRET_KEY
 
 # Editors / OS

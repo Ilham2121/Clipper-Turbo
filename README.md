@@ -46,6 +46,32 @@ Details worth knowing:
 
 ## Setup
 
+### Docker (recommended)
+
+Runs both services with hot reload; no local Python/Node/ffmpeg needed beyond
+Docker itself.
+
+```bash
+cp .env.example .env      # optional: set CLIPPER_SECRET_KEY
+docker compose up --build
+```
+
+- UI → http://localhost:5173
+- API → http://localhost:8000/api/health
+
+Source is bind-mounted, so edits to `backend/` and `frontend/src/` reload
+automatically. Downloaded Whisper models live in a named volume, so they are
+only fetched once.
+
+On Linux, if the backend cannot write to `storage/`, set your user id in `.env`:
+
+```
+CLIPPER_UID=1000
+CLIPPER_GID=1000
+```
+
+### Manual
+
 **Backend** (from the project root):
 
 ```bash
@@ -70,6 +96,12 @@ Settings → API Key (stored encrypted in the local database, reused after that)
 
 ```bash
 python -m pytest test_youtube_clip_generator.py
+```
+
+Or inside the container (no local Python needed):
+
+```bash
+docker compose exec backend python -m pytest test_youtube_clip_generator.py
 ```
 
 The suite maps to the acceptance criteria and edge cases in `prd-youtube-clip-generator.md`.
@@ -104,9 +136,12 @@ backend/
   models/db.py    SQLAlchemy store (jobs, clips, llm_api_keys, app_settings)
   pipeline/       ingest, transcribe, karaoke, speaker, render, pipeline
   selectors/      llm_selector, manual_selector
+  Dockerfile
 frontend/src/
   components/     JobForm, JobProgress, ClipResults, SettingsDrawer, ...
   api/client.ts
+  Dockerfile
+docker-compose.yml
 ```
 
 ## Known limitations
@@ -118,7 +153,10 @@ frontend/src/
 - Stored API keys use XOR encryption with a key from `CLIPPER_SECRET_KEY`. Set
   a real secret (and treat it as sensitive) if this runs anywhere but your own
   machine.
-- `os.startfile()` reveal-folder only works on a local desktop host.
+- `os.startfile()` reveal-folder only works on a local desktop host, so the
+  "open folder" buttons do nothing inside a Linux container.
+- Hardware encoding needs GPU passthrough. The container falls back to CPU
+  (`libx264`) automatically, which is slower.
 
 ## Docs
 

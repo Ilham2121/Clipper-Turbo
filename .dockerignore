@@ -1,0 +1,26 @@
+# Keep the build context small: no runtime data, no venvs, no caches.
+storage/
+.git/
+.github/
+node_modules/
+frontend/node_modules/
+frontend/dist/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Internal design docs are not needed inside the image.
+prd-youtube-clip-generator.md
+plan.md
+optimize.md
+
+.env
+.env.*
+*.log
+.DS_Store
+Thumbs.db

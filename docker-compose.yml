@@ -1,0 +1,59 @@
+# Two services: FastAPI backend + Vite dev server.
+#
+#   docker compose up --build
+#   -> UI   http://localhost:5173
+#   -> API  http://localhost:8000/api/health
+#
+# Source is bind-mounted so both services hot-reload on edit. Named volumes
+# keep installed deps and downloaded Whisper models out of the host repo.
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app/backend
+      - ./conftest.py:/app/conftest.py
+      - ./test_youtube_clip_generator.py:/app/test_youtube_clip_generator.py
+      - ./storage:/app/storage
+      # Cache of downloaded Whisper models — avoids re-downloading (~500MB).
+      - whisper-cache:/home/app/.cache/huggingface
+    environment:
+      CLIPPER_DB_PATH: /app/storage/clipper.db
+      CLIPPER_MAX_CONCURRENT_JOBS: "2"
+      CLIPPER_RENDER_WORKERS: "2"
+      CLIPPER_ASR_MODEL: small
+      CLIPPER_CLEANUP_INTERVAL_MINUTES: "60"
+      # Set a real secret to keep stored LLM keys encrypted with your own key.
+      CLIPPER_SECRET_KEY: ${CLIPPER_SECRET_KEY:-dev-only-change-me}
+    # On Linux, the bind-mounted ./storage is owned by your host user while the
+    # container runs as uid 1000. Set CLIPPER_UID/GID to your `id -u`/`id -g`
+    # in .env if you hit permission errors writing clips.
+    user: "${CLIPPER_UID:-1000}:${CLIPPER_GID:-1000}"
+    # Whisper on CPU is memory-hungry; lower this if your machine struggles.
+    shm_size: "1gb"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/public:/app/public
+      - ./frontend/vite.config.ts:/app/vite.config.ts
+      # Keeps container node_modules from being shadowed by the host copy.
+      - frontend-node-modules:/app/node_modules
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  whisper-cache:
+  frontend-node-modules:

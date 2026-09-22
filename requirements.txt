@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+yt-dlp
+faster-whisper
+mediapipe
+opencv-python
+protobuf>=4.25.3,<5
+requests
+pydantic
+sqlalchemy

@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Runtime data (videos, clips, local SQLite)
+storage/
+!storage/.gitkeep
+
+# Frontend
+node_modules/
+frontend/dist/
+*.local
+
+# Env & secrets
+.env
+.env.*
+CLIPPER_SECRET_KEY
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Internal docs (design notes, not part of the public repo)
+prd-youtube-clip-generator.md
+plan.md
+optimize.md

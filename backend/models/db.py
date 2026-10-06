@@ -21,6 +21,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Integer,
     String,
     Text,
     create_engine,
@@ -51,6 +52,8 @@ class JobRow(Base):
     selection_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     progress_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -58,6 +61,12 @@ class JobRow(Base):
     warning: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress_log: Mapped[list | None] = mapped_column(JSON, nullable=True)
     options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    current_stage: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    stage_progress: Mapped[float | None] = mapped_column(Float, nullable=True)
+    eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    eta_low_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    eta_high_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stage_timings: Mapped[list | None] = mapped_column(JSON, nullable=True)
 
 
 class ClipRow(Base):
@@ -99,6 +108,20 @@ class AppSettingRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
 
+class StageMetricRow(Base):
+    """Timing and work metrics per pipeline stage."""
+
+    __tablename__ = "job_stage_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
+    work_units: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    config_key: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 @dataclass
 class JobRecord:
     """Attribute-style DTO returned by get_job (unchanged contract)."""
@@ -108,6 +131,8 @@ class JobRecord:
     selection_mode: str
     status: str = "queued"
     created_at: datetime = field(default_factory=datetime.utcnow)
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
     progress_percent: float | None = None
     error_stage: str | None = None
     error_message: str | None = None
@@ -116,6 +141,12 @@ class JobRecord:
     warning: str | None = None
     progress_log: list[dict[str, Any]] | None = None
     options: dict[str, Any] | None = None
+    current_stage: str | None = None
+    stage_progress: float | None = None
+    eta_seconds: int | None = None
+    eta_low_seconds: int | None = None
+    eta_high_seconds: int | None = None
+    stage_timings: list[dict[str, Any]] | None = None
 
 
 class JobStore:
@@ -140,13 +171,29 @@ class JobStore:
             cursor.close()
 
         Base.metadata.create_all(self._engine)
-        # Lightweight migration for pre-existing DB files (new nullable column).
+        # Lightweight migration for pre-existing DB files (new nullable columns).
         with self._engine.begin() as conn:
             cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(jobs)").fetchall()]
             if "progress_log" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN progress_log JSON")
             if "options" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN options JSON")
+            if "started_at" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN started_at DATETIME")
+            if "finished_at" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN finished_at DATETIME")
+            if "current_stage" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN current_stage VARCHAR(64)")
+            if "stage_progress" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN stage_progress FLOAT")
+            if "eta_seconds" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_seconds INTEGER")
+            if "eta_low_seconds" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_low_seconds INTEGER")
+            if "eta_high_seconds" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_high_seconds INTEGER")
+            if "stage_timings" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN stage_timings JSON")
         self._sessions = sessionmaker(bind=self._engine, expire_on_commit=False)
         self._lock = threading.Lock()
 
@@ -172,6 +219,8 @@ class JobStore:
             selection_mode=job.selection_mode,
             status=job.status,
             created_at=job.created_at,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
             progress_percent=job.progress_percent,
             error_stage=job.error_stage,
             error_message=job.error_message,
@@ -180,6 +229,12 @@ class JobStore:
             warning=job.warning,
             progress_log=list(job.progress_log or []),
             options=job.options,
+            current_stage=job.current_stage,
+            stage_progress=job.stage_progress,
+            eta_seconds=job.eta_seconds,
+            eta_low_seconds=job.eta_low_seconds,
+            eta_high_seconds=job.eta_high_seconds,
+            stage_timings=list(job.stage_timings or []),
         )
 
     def create_job(
@@ -221,6 +276,14 @@ class JobStore:
         error_stage: str | None = None,
         error_message: str | None = None,
         warning: str | None = None,
+        stage: str | None = None,
+        stage_progress: float | None = None,
+        eta_seconds: int | None = None,
+        eta_low_seconds: int | None = None,
+        eta_high_seconds: int | None = None,
+        stage_timings: list[dict[str, Any]] | None = None,
+        started_at: datetime | None = None,
+        finished_at: datetime | None = None,
     ) -> JobRecord | None:
         with self._lock, self._sessions() as session:
             job = session.get(JobRow, job_id)
@@ -235,6 +298,22 @@ class JobStore:
                 job.error_message = error_message
             if warning is not None:
                 job.warning = warning
+            if stage is not None:
+                job.current_stage = stage
+            if stage_progress is not None:
+                job.stage_progress = stage_progress
+            if eta_seconds is not None:
+                job.eta_seconds = eta_seconds
+            if eta_low_seconds is not None:
+                job.eta_low_seconds = eta_low_seconds
+            if eta_high_seconds is not None:
+                job.eta_high_seconds = eta_high_seconds
+            if stage_timings is not None:
+                job.stage_timings = stage_timings
+            if started_at is not None:
+                job.started_at = started_at
+            if finished_at is not None:
+                job.finished_at = finished_at
             session.commit()
             clips = session.scalars(
                 select(ClipRow).where(ClipRow.job_id == job_id)
@@ -386,6 +465,44 @@ class JobStore:
             row.last_verified_at = datetime.utcnow()
             row.last_verified_ok = ok
             session.commit()
+
+    # -- Stage metrics for ETA predictions and diagnostics --
+
+    def record_stage_metric(
+        self,
+        job_id: str,
+        stage: str,
+        duration_seconds: float,
+        work_units: float = 0.0,
+        config_key: str = "",
+    ) -> None:
+        with self._lock, self._sessions() as session:
+            metric = StageMetricRow(
+                job_id=job_id,
+                stage=stage,
+                duration_seconds=float(duration_seconds),
+                work_units=float(work_units),
+                config_key=config_key,
+            )
+            session.add(metric)
+            session.commit()
+
+    def get_stage_metrics_summary(self) -> dict[str, Any]:
+        with self._sessions() as session:
+            rows = session.scalars(select(StageMetricRow)).all()
+            by_stage: dict[str, list[float]] = {}
+            for r in rows:
+                by_stage.setdefault(r.stage, []).append(r.duration_seconds)
+            summary = {
+                stage: {
+                    "count": len(durs),
+                    "avgSeconds": round(sum(durs) / len(durs), 2),
+                    "minSeconds": round(min(durs), 2),
+                    "maxSeconds": round(max(durs), 2),
+                }
+                for stage, durs in by_stage.items()
+            }
+            return {"stages": summary, "totalRecords": len(rows)}
 
 
 # Global singleton instance for the app

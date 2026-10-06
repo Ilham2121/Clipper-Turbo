@@ -1961,13 +1961,13 @@ class TestEstimate:
         assert data["title"] == "Est Vid"
         assert data["duration"] == 600.0
         assert data["hardwareAccelerated"] is False
-        assert data["estimatedSeconds"] == 600
-        assert data["breakdown"]["download"] == 150
-        assert data["breakdown"]["transcribe"] == 270
-        assert data["breakdown"]["render"] == 180
+        assert data["estimatedSeconds"] == 165
+        assert data["breakdown"]["download"] == 29
+        assert data["breakdown"]["transcribe"] == 96
+        assert data["breakdown"]["render"] == 33
 
     def test_estimate_hardware_factor(self, api_client):
-        """Codec HW mempercepat estimasi (~0.35x)."""
+        """Codec HW mempercepat estimasi (akselerasi GPU)."""
         from unittest.mock import patch as _patch
 
         with _patch(
@@ -1984,7 +1984,7 @@ class TestEstimate:
                 )
         assert resp.status_code == 200
         assert resp.json()["hardwareAccelerated"] is True
-        assert resp.json()["estimatedSeconds"] == 210
+        assert resp.json()["estimatedSeconds"] == 82
 
     def test_estimate_rejects_invalid_or_unknown(self, api_client):
         """URL invalid/SSRF -> 422; probe gagal -> 422."""
@@ -3395,5 +3395,150 @@ class TestTextNormalizeAndKaraokeSync:
         assert r"Selamat {\c&H00D7FF&\3c&H000000&\b1}datang{\r} kawan" in dialogues[1]
         # Third dialogue highlights kawan
         assert r"Selamat datang {\c&H00D7FF&\3c&H000000&\b1}kawan{\r}" in dialogues[2]
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Reliable Processing ETA & Stage Metrics Tests
+# ---------------------------------------------------------------------------
+
+class TestPhase3ReliableETA:
+
+    def test_eta_stage_priors_scaling(self):
+        """estimate_stage_priors scales appropriately with duration, formats, and hardware."""
+        from backend.core.eta import ETAPredictor
+
+        priors_cpu_1fmt = ETAPredictor.estimate_stage_priors(
+            video_duration=100.0,
+            output_formats=["9:16"],
+            cuda_available=False,
+        )
+        assert "downloading" in priors_cpu_1fmt
+        assert "transcribing" in priors_cpu_1fmt
+        assert "selecting_segments" in priors_cpu_1fmt
+        assert "rendering" in priors_cpu_1fmt
+
+        priors_cpu_2fmt = ETAPredictor.estimate_stage_priors(
+            video_duration=100.0,
+            output_formats=["9:16", "16:9"],
+            cuda_available=False,
+        )
+        # Rendering 2 formats takes longer than 1 format
+        assert priors_cpu_2fmt["rendering"] > priors_cpu_1fmt["rendering"]
+
+        priors_cuda = ETAPredictor.estimate_stage_priors(
+            video_duration=100.0,
+            output_formats=["9:16"],
+            cuda_available=True,
+        )
+        # CUDA acceleration cuts transcription and render times
+        assert priors_cuda["transcribing"] < priors_cpu_1fmt["transcribing"]
+        assert priors_cuda["rendering"] < priors_cpu_1fmt["rendering"]
+
+    def test_eta_refine_render_estimate(self):
+        """refine_render_estimate computes exact render duration based on selected segments."""
+        from backend.core.eta import ETAPredictor
+
+        segments_short = [{"start": 0.0, "end": 20.0}]
+        segments_long = [{"start": 0.0, "end": 60.0}, {"start": 70.0, "end": 130.0}]
+
+        est_short = ETAPredictor.refine_render_estimate(segments_short, output_formats=["9:16"])
+        est_long = ETAPredictor.refine_render_estimate(segments_long, output_formats=["9:16"])
+
+        assert est_long > est_short
+
+    def test_eta_live_correction_and_bounds(self):
+        """calculate_live_eta uses observed speed to update ETA with valid [low, high] bounds."""
+        from backend.core.eta import ETAPredictor
+
+        priors = {"downloading": 20.0, "transcribing": 30.0, "selecting_segments": 10.0, "rendering": 40.0}
+
+        # Early in downloading (progress 5%, elapsed 2s)
+        eta, low, high = ETAPredictor.calculate_live_eta(
+            current_stage="downloading",
+            stage_progress=0.05,
+            stage_elapsed=2.0,
+            stage_estimates=priors,
+        )
+        assert low <= eta <= high
+        assert eta > 0
+
+        # Fast progress in downloading (50% done in only 3 seconds -> expected total download ~6s, not 20s)
+        eta_fast, low_fast, high_fast = ETAPredictor.calculate_live_eta(
+            current_stage="downloading",
+            stage_progress=0.5,
+            stage_elapsed=3.0,
+            stage_estimates=priors,
+        )
+        assert eta_fast < eta
+        assert low_fast <= eta_fast <= high_fast
+
+    def test_eta_format_display(self):
+        """format_eta_display produces friendly readable Indonesian time strings."""
+        from backend.core.eta import format_eta_display
+
+        assert format_eta_display(0) == "Hampir selesai"
+        assert "dtk" in format_eta_display(45)
+        assert "mnt" in format_eta_display(180)
+        assert "–" in format_eta_display(150, low_seconds=120, high_seconds=190)
+
+    def test_db_stage_metrics_and_eta_fields(self):
+        """JobStore stores ETA, stage timings, and persists stage metrics."""
+        from datetime import datetime
+        from backend.models.db import db
+
+        job = db.create_job(
+            job_id="test-eta-job-001",
+            youtube_url="https://youtube.com/watch?v=TESTETA001",
+            selection_mode="auto",
+        )
+        assert job.id == "test-eta-job-001"
+
+        updated = db.update_status(
+            job_id="test-eta-job-001",
+            status="transcribing",
+            stage="transcribing",
+            stage_progress=0.4,
+            eta_seconds=45,
+            eta_low_seconds=35,
+            eta_high_seconds=60,
+            stage_timings=[{"stage": "downloading", "seconds": 12.5}],
+            started_at=datetime.utcnow(),
+        )
+        assert updated is not None
+        assert updated.current_stage == "transcribing"
+        assert updated.eta_seconds == 45
+        assert updated.eta_low_seconds == 35
+        assert updated.eta_high_seconds == 60
+        assert len(updated.stage_timings) == 1
+
+        db.record_stage_metric(
+            job_id="test-eta-job-001",
+            stage="downloading",
+            duration_seconds=12.5,
+            work_units=120.0,
+        )
+        metrics = db.get_stage_metrics_summary()
+        assert "stages" in metrics
+        assert "downloading" in metrics["stages"]
+
+    def test_api_metrics_eta_endpoint(self, api_client):
+        """GET /api/metrics/eta returns stage metrics summary."""
+        resp = api_client.get("/api/metrics/eta")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "stages" in data
+        assert "totalRecords" in data
+
+    def test_api_estimate_endpoint_reliable_eta(self, api_client):
+        """GET /api/estimate returns reliable ETA range and breakdown."""
+        with patch("backend.api.routes.jobs.probe_video_metadata", return_value={"title": "Test", "duration": 180.0}):
+            resp = api_client.get("/api/estimate?youtubeUrl=https://www.youtube.com/watch?v=TESTETA999")
+            assert resp.status_code == 200
+            data = resp.json()
+            assert "estimatedSeconds" in data
+            assert "etaLowSeconds" in data
+            assert "etaHighSeconds" in data
+            assert "breakdown" in data
+            assert data["etaLowSeconds"] <= data["estimatedSeconds"] <= data["etaHighSeconds"]
 
 

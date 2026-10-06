@@ -65,6 +65,16 @@ export interface JobStatusResponse {
   clips?: ClipInfo[] | null;
   warning?: string | null;
   progressLog?: ProgressLogEntry[] | null;
+  createdAt?: string | null;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  serverNow?: string | null;
+  stage?: string | null;
+  stageProgress?: number | null;
+  etaSeconds?: number | null;
+  etaLowSeconds?: number | null;
+  etaHighSeconds?: number | null;
+  stageTimings?: { stage: string; seconds: number }[] | null;
 }
 
 const LOG_VISIBILITY_KEY = 'clipper-turbo:progress-log-visible';
@@ -408,6 +418,8 @@ export interface EstimateResponse {
   title: string;
   duration: number;
   estimatedSeconds: number;
+  etaLowSeconds?: number;
+  etaHighSeconds?: number;
   hardwareAccelerated: boolean;
   breakdown: EstimateBreakdown;
 }
@@ -418,6 +430,24 @@ export function formatEstimate(totalSeconds: number): string {
   const m = Math.floor(s / 60);
   const r = s % 60;
   return r === 0 ? `±${m} menit` : `±${m} mnt ${r} dtk`;
+}
+
+export function formatEstimateRange(
+  seconds?: number | null,
+  lowSeconds?: number | null,
+  highSeconds?: number | null,
+): string {
+  if (seconds === null || seconds === undefined || seconds <= 0) return 'Hampir selesai';
+  if (lowSeconds && highSeconds && highSeconds > lowSeconds) {
+    const lowM = Math.ceil(lowSeconds / 60);
+    const highM = Math.ceil(highSeconds / 60);
+    if (highSeconds < 60) return `±${seconds} dtk lagi`;
+    if (lowM === highM) return `~${lowM} mnt lagi`;
+    return `~${lowM}–${highM} mnt lagi`;
+  }
+  if (seconds < 60) return `±${seconds} dtk lagi`;
+  const m = Math.ceil(seconds / 60);
+  return `~${m} mnt lagi`;
 }
 
 export async function getEstimate(youtubeUrl: string): Promise<EstimateResponse | null> {

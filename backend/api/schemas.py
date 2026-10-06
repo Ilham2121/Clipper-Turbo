@@ -4,6 +4,7 @@ Traces to: AC-11 (FR-7: mode switch payload shapes and field exclusivity),
            API Contracts in PRD §7 (CreateJobRequest, CreateJobResponse, JobStatusResponse).
 """
 
+from datetime import datetime
 from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -137,6 +138,8 @@ class EstimateResponse(BaseModel):
     title: str
     duration: float
     estimated_seconds: int = Field(..., alias="estimatedSeconds")
+    eta_low_seconds: int | None = Field(None, alias="etaLowSeconds")
+    eta_high_seconds: int | None = Field(None, alias="etaHighSeconds")
     hardware_accelerated: bool = Field(..., alias="hardwareAccelerated")
     breakdown: EstimateBreakdown
 
@@ -179,3 +182,13 @@ class JobStatusResponse(BaseModel):
     clips: list[ClipInfo] | None = None
     warning: str | None = None
     progress_log: list[dict[str, Any]] | None = Field(None, alias="progressLog")
+    created_at: datetime | None = Field(None, alias="createdAt")
+    started_at: datetime | None = Field(None, alias="startedAt")
+    finished_at: datetime | None = Field(None, alias="finishedAt")
+    server_now: datetime = Field(default_factory=datetime.utcnow, alias="serverNow")
+    stage: str | None = Field(None, alias="stage")
+    stage_progress: float | None = Field(None, alias="stageProgress")
+    eta_seconds: int | None = Field(None, alias="etaSeconds")
+    eta_low_seconds: int | None = Field(None, alias="etaLowSeconds")
+    eta_high_seconds: int | None = Field(None, alias="etaHighSeconds")
+    stage_timings: list[dict[str, Any]] | None = Field(None, alias="stageTimings")

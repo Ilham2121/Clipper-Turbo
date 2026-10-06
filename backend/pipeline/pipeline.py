@@ -4,11 +4,14 @@ Traces to: plan.md §2 (state machine: queued -> downloading -> transcribing -> 
            FR-1 to FR-12,
            AC-8 (delivery with downloadUrl),
            AC-9 (status polling),
-           AC-12 (non-blocking background execution).
+           AC-12 (non-blocking background execution),
+           Phase 3: Reliable Processing ETA & Stage Metrics.
 """
 
 import os
 import shutil
+import time
+from datetime import datetime
 from typing import Any
 
 from backend.api.schemas import CreateJobRequest
@@ -20,16 +23,18 @@ from backend.core.errors import (
     SegmentValidationError,
     TranscriptionError,
 )
+from backend.core.eta import ETAPredictor
 from backend.core.limiter import job_limiter
 from backend.models.db import db
 from backend.pipeline.ingest import download_video
 from backend.pipeline.karaoke import SubtitleStyle
-from backend.pipeline.render import render_segments
+from backend.pipeline.render import detect_available_video_codec, render_segments
 from backend.pipeline.selectors.llm_selector import LLMSelector
 from backend.pipeline.selectors.manual_selector import ManualSelector
 from backend.pipeline.transcribe import transcribe
 
 SUBTITLE_SETTINGS_KEY = "subtitle_style"
+ASR_SETTINGS_KEY = "asr_settings"
 
 
 def _resolve_stored_llm(request: CreateJobRequest) -> dict[str, Any]:
@@ -52,10 +57,7 @@ def run_pipeline(
     request: CreateJobRequest,
     storage_root: str = "storage",
 ) -> None:
-    """Execute the full video clipping pipeline for a job.
-
-    Throttled by job_limiter to cap active concurrent executions.
-    """
+    """Execute the full 5-stage clipping pipeline with realistic ETA tracking."""
     with job_limiter:
         job_dir = os.path.join(storage_root, "jobs", job_id)
         raw_dir = os.path.join(job_dir, "raw")
@@ -64,6 +66,26 @@ def run_pipeline(
         os.makedirs(clips_dir, exist_ok=True)
 
         current_stage = "queued"
+        pipeline_started_at = datetime.utcnow()
+        stage_start_time = time.time()
+        stage_timings: list[dict[str, Any]] = []
+
+        hw_accel = detect_available_video_codec() != "libx264"
+        asr_config = db.get_setting(ASR_SETTINGS_KEY) or {}
+        asr_model = str(asr_config.get("model", "small"))
+
+        stage_priors = ETAPredictor.estimate_stage_priors(
+            video_duration=120.0,
+            output_formats=request.output_formats,
+            cuda_available=hw_accel,
+            asr_model=asr_model,
+        )
+        eta, eta_low, eta_high = ETAPredictor.calculate_live_eta(
+            current_stage="downloading",
+            stage_progress=0.1,
+            stage_elapsed=0.0,
+            stage_estimates=stage_priors,
+        )
 
         def _log(msg: str) -> None:
             db.append_log(job_id, msg)
@@ -74,18 +96,43 @@ def run_pipeline(
         )
 
         try:
-            # Stage 1: Ingest
+            # Stage 1: Ingest (Downloading)
             current_stage = "downloading"
-            db.update_status(job_id, status=current_stage, progress_percent=10.0)
+            db.update_status(
+                job_id,
+                status=current_stage,
+                progress_percent=8.0,
+                stage=current_stage,
+                stage_progress=0.08,
+                eta_seconds=eta,
+                eta_low_seconds=eta_low,
+                eta_high_seconds=eta_high,
+                stage_timings=list(stage_timings),
+                started_at=pipeline_started_at,
+            )
             _log(f"Mengunduh video: {request.youtube_url}")
             video_info = download_video(request.youtube_url, raw_dir)
             video_path = video_info["video_path"]
             subtitle_path = video_info.get("subtitle_path")
-            video_duration = video_info.get("duration", 60.0)
+            video_duration = float(video_info.get("duration", 60.0))
+
+            download_duration = round(time.time() - stage_start_time, 2)
+            stage_timings.append({"stage": "downloading", "seconds": download_duration})
+            db.record_stage_metric(job_id, "downloading", download_duration, video_duration)
+
             _log(
                 f"Unduhan selesai: '{video_info.get('title', '')}' "
-                f"({float(video_duration):.0f} dtk)"
+                f"({video_duration:.0f} dtk, durasi unduh {download_duration:.1f}s)"
             )
+
+            # Refine stage priors using true video duration
+            stage_priors = ETAPredictor.estimate_stage_priors(
+                video_duration=video_duration,
+                output_formats=request.output_formats,
+                cuda_available=hw_accel,
+                asr_model=asr_model,
+            )
+            stage_priors["downloading"] = download_duration
 
             # EC-2: Video duration > 2 hours (> 7200s) warning
             if video_duration > 7200:
@@ -97,17 +144,57 @@ def run_pipeline(
 
             # Stage 2: Transcribe
             current_stage = "transcribing"
-            db.update_status(job_id, status=current_stage, progress_percent=30.0)
+            stage_start_time = time.time()
+            eta, eta_low, eta_high = ETAPredictor.calculate_live_eta(
+                current_stage=current_stage,
+                stage_progress=0.0,
+                stage_elapsed=0.0,
+                stage_estimates=stage_priors,
+                previous_eta=eta,
+            )
+            db.update_status(
+                job_id,
+                status=current_stage,
+                progress_percent=25.0,
+                stage=current_stage,
+                stage_progress=0.0,
+                eta_seconds=eta,
+                eta_low_seconds=eta_low,
+                eta_high_seconds=eta_high,
+                stage_timings=list(stage_timings),
+            )
             _log(
                 "Transkripsi: memakai subtitle YouTube"
                 if subtitle_path else "Transkripsi: menjalankan ASR (faster-whisper)"
             )
             transcript = transcribe(video_path, subtitle_path)
-            _log(f"Transkrip siap: {len(transcript)} segmen teks")
+            transcribe_duration = round(time.time() - stage_start_time, 2)
+            stage_timings.append({"stage": "transcribing", "seconds": transcribe_duration})
+            db.record_stage_metric(job_id, "transcribing", transcribe_duration, video_duration)
+            stage_priors["transcribing"] = transcribe_duration
+            _log(f"Transkrip siap: {len(transcript)} segmen teks ({transcribe_duration:.1f}s)")
 
             # Stage 3: Select Segments
             current_stage = "selecting_segments"
-            db.update_status(job_id, status=current_stage, progress_percent=55.0)
+            stage_start_time = time.time()
+            eta, eta_low, eta_high = ETAPredictor.calculate_live_eta(
+                current_stage=current_stage,
+                stage_progress=0.0,
+                stage_elapsed=0.0,
+                stage_estimates=stage_priors,
+                previous_eta=eta,
+            )
+            db.update_status(
+                job_id,
+                status=current_stage,
+                progress_percent=55.0,
+                stage=current_stage,
+                stage_progress=0.0,
+                eta_seconds=eta,
+                eta_low_seconds=eta_low,
+                eta_high_seconds=eta_high,
+                stage_timings=list(stage_timings),
+            )
             if request.selection_mode == "manual":
                 raw_segments: list[dict[str, Any]] = [
                     s.model_dump() if hasattr(s, "model_dump") else dict(s)
@@ -130,6 +217,11 @@ def run_pipeline(
                 best = f", skor tertinggi {max(scores)}" if scores else ""
                 _log(f"Ditemukan {len(segments)} segmen kandidat{best}")
 
+            select_duration = round(time.time() - stage_start_time, 2)
+            stage_timings.append({"stage": "selecting_segments", "seconds": select_duration})
+            db.record_stage_metric(job_id, "selecting_segments", select_duration, len(segments))
+            stage_priors["selecting_segments"] = select_duration
+
             # Stage 3 (cont.): subtitle source selection
             burn_subtitles = getattr(request, "burn_subtitles", True)
             karaoke_ready = bool(transcript) and any(seg.get("words") for seg in transcript)
@@ -142,11 +234,37 @@ def run_pipeline(
             else:
                 _log("Tanpa subtitle: word timestamps tidak tersedia")
 
+            # Refine render prior with exact selected segments!
+            render_prior_refined = ETAPredictor.refine_render_estimate(
+                segments=segments,
+                output_formats=request.output_formats,
+                cuda_available=hw_accel,
+            )
+            stage_priors["rendering"] = render_prior_refined
+
             # Stage 4: Render
             current_stage = "rendering"
-            db.update_status(job_id, status=current_stage, progress_percent=75.0)
+            stage_start_time = time.time()
+            eta, eta_low, eta_high = ETAPredictor.calculate_live_eta(
+                current_stage=current_stage,
+                stage_progress=0.0,
+                stage_elapsed=0.0,
+                stage_estimates=stage_priors,
+                previous_eta=eta,
+            )
+            db.update_status(
+                job_id,
+                status=current_stage,
+                progress_percent=72.0,
+                stage=current_stage,
+                stage_progress=0.0,
+                eta_seconds=eta,
+                eta_low_seconds=eta_low,
+                eta_high_seconds=eta_high,
+                stage_timings=list(stage_timings),
+            )
             total_clips = len(segments) * len(request.output_formats)
-            _log(f"Render dimulai: {total_clips} klip dari {len(segments)} segmen")
+            _log(f"Render dimulai: {total_clips} klip dari {len(segments)} segmen (estimasi ±{render_prior_refined:.0f}s)")
             rendered_clips = render_segments(
                 video_path=video_path,
                 segments=segments,
@@ -159,6 +277,12 @@ def run_pipeline(
                 ),
                 burn_subtitles=burn_subtitles,
             )
+
+            render_duration = round(time.time() - stage_start_time, 2)
+            stage_timings.append({"stage": "rendering", "seconds": render_duration})
+            clip_seconds_total = sum(max(0.0, float(s.get("end", 0.0)) - float(s.get("start", 0.0))) for s in segments)
+            db.record_stage_metric(job_id, "rendering", render_duration, clip_seconds_total * len(request.output_formats))
+
             for i, c in enumerate(rendered_clips, start=1):
                 sub = "karaoke" if c.get("karaoke") else ("subtitle" if c.get("subtitle_burned") else "tanpa subtitle")
                 layout = c.get("layout_type", "center-crop")
@@ -190,9 +314,22 @@ def run_pipeline(
                     "hashtags": c.get("hashtags", []),
                 })
 
+            finished_at = datetime.utcnow()
+            total_time = round(time.time() - (pipeline_started_at.timestamp() if hasattr(pipeline_started_at, 'timestamp') else time.time()), 1)
             db.add_clips(job_id, formatted_clips)
-            db.update_status(job_id, status="completed", progress_percent=100.0)
-            _log(f"Selesai: {len(formatted_clips)} klip siap diunduh")
+            db.update_status(
+                job_id,
+                status="completed",
+                progress_percent=100.0,
+                stage="completed",
+                stage_progress=1.0,
+                eta_seconds=0,
+                eta_low_seconds=0,
+                eta_high_seconds=0,
+                stage_timings=list(stage_timings),
+                finished_at=finished_at,
+            )
+            _log(f"Selesai: {len(formatted_clips)} klip siap diunduh (total waktu {total_time:.1f}s)")
 
         except Exception as exc:
             db.update_status(
@@ -200,10 +337,10 @@ def run_pipeline(
                 status="failed",
                 error_stage=current_stage,
                 error_message=str(exc),
+                finished_at=datetime.utcnow(),
             )
             _log(f"Gagal pada tahap {current_stage}: {exc}")
         finally:
             # Fase 2 Iterasi 2.1: hapus file mentah (sukses maupun gagal);
             # hasil klip di clips_dir tetap dipertahankan (AC-8).
             shutil.rmtree(raw_dir, ignore_errors=True)
-

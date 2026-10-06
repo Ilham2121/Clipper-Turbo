@@ -27,8 +27,9 @@ from backend.api.schemas import (
     JobStatusResponse,
 )
 from backend.core.config import decrypt_at_rest
+from backend.core.eta import ETAPredictor
 from backend.models.db import db
-from backend.pipeline.ingest import estimate_processing_seconds, probe_video_metadata, validate_youtube_url
+from backend.pipeline.ingest import probe_video_metadata, validate_youtube_url
 from backend.pipeline.pipeline import run_pipeline
 from backend.pipeline.render import detect_available_video_codec
 
@@ -37,23 +38,31 @@ router = APIRouter(prefix="/api", tags=["jobs"])
 
 @router.get("/estimate", response_model=EstimateResponse)
 def estimate_processing_time(youtubeUrl: str = Query(..., alias="youtubeUrl")) -> EstimateResponse:
-    """Heuristic processing-time estimate from a metadata-only probe (no download)."""
+    """Processing-time estimate from a metadata-only probe using reliable rate priors."""
     if not validate_youtube_url(youtubeUrl):
         raise HTTPException(status_code=422, detail=f"Invalid YouTube URL: '{youtubeUrl}'")
     meta = probe_video_metadata(youtubeUrl)
     if not meta or not meta.get("duration"):
         raise HTTPException(status_code=422, detail="Could not read video duration (private/deleted/rate-limited).")
     hw = detect_available_video_codec() != "libx264"
-    parts = estimate_processing_seconds(float(meta["duration"]), hardware_accelerated=hw)
+    priors = ETAPredictor.estimate_stage_priors(
+        video_duration=float(meta["duration"]),
+        cuda_available=hw,
+    )
+    total_sec = int(round(sum(priors.values())))
+    eta_low = max(5, int(round(total_sec * 0.80)))
+    eta_high = max(10, int(round(total_sec * 1.35)))
     return EstimateResponse(
         title=meta.get("title", ""),
         duration=float(meta["duration"]),
-        estimated_seconds=parts["total"],
+        estimated_seconds=total_sec,
+        eta_low_seconds=eta_low,
+        eta_high_seconds=eta_high,
         hardware_accelerated=hw,
         breakdown=EstimateBreakdown(
-            download=parts["download"],
-            transcribe=parts["transcribe"],
-            render=parts["render"],
+            download=int(round(priors["downloading"])),
+            transcribe=int(round(priors["transcribing"])),
+            render=int(round(priors["rendering"])),
         ),
     )
 
@@ -139,6 +148,15 @@ def _build_status_payload(job_id: str) -> JobStatusResponse:
         clips=clips_data,
         warning=job.warning,
         progress_log=job.progress_log,
+        created_at=job.created_at,
+        started_at=job.started_at,
+        finished_at=job.finished_at,
+        stage=job.current_stage,
+        stage_progress=job.stage_progress,
+        eta_seconds=job.eta_seconds,
+        eta_low_seconds=job.eta_low_seconds,
+        eta_high_seconds=job.eta_high_seconds,
+        stage_timings=job.stage_timings,
     )
 
 
@@ -260,3 +278,9 @@ def download_all_clips(job_id: str) -> Response:
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="clips-{job_id}.zip"'},
     )
+
+
+@router.get("/metrics/eta")
+def get_eta_metrics() -> dict:
+    """Return historical pipeline stage timings and calibration metrics."""
+    return db.get_stage_metrics_summary()

@@ -57,6 +57,7 @@ class JobRow(Base):
     storage_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
     warning: Mapped[str | None] = mapped_column(Text, nullable=True)
     progress_log: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    options: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class ClipRow(Base):
@@ -114,6 +115,7 @@ class JobRecord:
     storage_dir: str | None = None
     warning: str | None = None
     progress_log: list[dict[str, Any]] | None = None
+    options: dict[str, Any] | None = None
 
 
 class JobStore:
@@ -143,6 +145,8 @@ class JobStore:
             cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(jobs)").fetchall()]
             if "progress_log" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN progress_log JSON")
+            if "options" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN options JSON")
         self._sessions = sessionmaker(bind=self._engine, expire_on_commit=False)
         self._lock = threading.Lock()
 
@@ -175,6 +179,7 @@ class JobStore:
             storage_dir=job.storage_dir,
             warning=job.warning,
             progress_log=list(job.progress_log or []),
+            options=job.options,
         )
 
     def create_job(
@@ -183,6 +188,7 @@ class JobStore:
         youtube_url: str,
         selection_mode: str,
         storage_dir: str | None = None,
+        options: dict[str, Any] | None = None,
     ) -> JobRecord:
         with self._lock, self._sessions() as session:
             job = JobRow(
@@ -191,6 +197,7 @@ class JobStore:
                 selection_mode=selection_mode,
                 status="queued",
                 storage_dir=storage_dir,
+                options=options,
             )
             session.add(job)
             session.commit()

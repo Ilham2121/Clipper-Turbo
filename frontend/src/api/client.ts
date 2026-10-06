@@ -16,6 +16,7 @@ export interface ClipInfo {
   segmentEnd: number;
   format: AspectRatio;
   downloadUrl: string;
+  subtitleUrl?: string | null;
   viralityScore?: number | null;
   hook?: string | null;
   caption?: string | null;
@@ -94,6 +95,7 @@ export interface CreateJobFormData {
   youtubeUrl: string;
   selectionMode: 'auto' | 'manual';
   outputFormats: AspectRatio[];
+  burnSubtitles?: boolean;
   manualSegments?: ManualSegment[];
   llmProvider?: string;
   llmApiKey?: string;
@@ -154,6 +156,7 @@ export function buildJobPayload(formData: CreateJobFormData): Record<string, unk
     youtubeUrl: formData.youtubeUrl,
     selectionMode: formData.selectionMode,
     outputFormats: formData.outputFormats,
+    burnSubtitles: formData.burnSubtitles ?? true,
   };
 
   if (formData.selectionMode === 'manual') {

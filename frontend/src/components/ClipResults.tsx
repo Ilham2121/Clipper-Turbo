@@ -91,6 +91,17 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
                   </button>
                 )}
 
+                {clip.subtitleUrl && (
+                  <a
+                    href={clip.subtitleUrl}
+                    download={`clip-${clip.id}-${clip.format.replace(':', 'x')}.srt`}
+                    className="btn-secondary"
+                    style={{ textAlign: 'center', textDecoration: 'none' }}
+                  >
+                    Unduh Subtitle (.srt)
+                  </a>
+                )}
+
                 <a
                   href={downloadUrl}
                   download={`clip-${clip.id}-${clip.format.replace(':', 'x')}.mp4`}

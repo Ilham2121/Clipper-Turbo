@@ -18,7 +18,9 @@ from functools import lru_cache
 from typing import Any, Literal
 
 from backend.core.errors import RenderError
-from backend.pipeline.karaoke import SubtitleStyle, transcript_to_ass_file
+from backend.pipeline.karaoke import SubtitleStyle, transcript_to_ass_file, transcript_to_srt_file
+from backend.pipeline.reframe import ReframeResult, build_reframe_filter
+from backend.pipeline.scene_classifier import LayoutType, classify_layout, classify_layout_from_faces
 from backend.pipeline.speaker import crop_track_expression, crop_x_expression, detect_face_center, detect_face_track
 
 VIDEO_CODEC_FALLBACK = "libx264"
@@ -104,6 +106,7 @@ def build_ffmpeg_command(
     video_codec: str | None = None,
     crop_focus: float | None = None,
     crop_track: list[tuple[float, float]] | None = None,
+    reframe: ReframeResult | None = None,
 ) -> list[str]:
     """Construct FFmpeg CLI arguments for trimming, aspect ratio cropping, and burning subtitles.
 
@@ -122,6 +125,9 @@ def build_ffmpeg_command(
             (Fase 4 Iterasi 4.2); None/invalid keeps legacy center crop.
         crop_track: [(t_seconds, x_normalized), ...] for dynamic crop pan
             (reaction/podcast movement); takes precedence over crop_focus.
+        reframe: Layout-aware reframe result from build_reframe_filter().
+            When provided for 9:16 format, overrides crop_focus/crop_track logic.
+            Complex-mode reframes use -filter_complex instead of -vf.
 
     Returns:
         List of command argument strings for subprocess.
@@ -131,8 +137,6 @@ def build_ffmpeg_command(
     if format_ratio not in ("9:16", "16:9"):
         raise ValueError(f"Unsupported format ratio: {format_ratio}. Must be '9:16' or '16:9'.")
 
-    # ponytail: no encoder tuning presets (p4/cq) or explicit pix_fmt on purpose;
-    # add when quality/size benchmark demands it.
     codec = resolve_video_codec(video_codec)
 
     cmd = [
@@ -146,22 +150,48 @@ def build_ffmpeg_command(
         video_path,
     ]
 
+    # Complex filtergraph path: layout-aware reframing (side_by_side, pip, gameplay).
+    if reframe and reframe.mode == "complex" and format_ratio == "9:16":
+        complex_parts = reframe.filter_expr
+        # Subtitle burn-in appended to the output pad of the complex filter.
+        if subtitle_path:
+            escaped_sub = escape_ffmpeg_subtitle_path(subtitle_path)
+            # Replace final [out] with subtitle filter chained before [out].
+            if reframe.output_label and reframe.output_label in complex_parts:
+                complex_parts = complex_parts.replace(
+                    reframe.output_label,
+                    f",subtitles='{escaped_sub}'{reframe.output_label}",
+                    1,  # replace last occurrence
+                )
+        cmd.extend(["-filter_complex", complex_parts])
+        if reframe.output_label:
+            cmd.extend(["-map", reframe.output_label])
+        cmd.extend(["-map", "0:a?", "-c:v", codec])
+
+        if normalize_audio:
+            cmd.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:a", "aac"])
+        else:
+            cmd.extend(["-c:a", "aac"])
+
+        cmd.append(output_path)
+        return cmd
+
+    # Simple filtergraph path: single crop expression.
     filters: list[str] = []
 
-    # Aspect ratio filter (FR-10)
     if format_ratio == "9:16":
-        track_expr = crop_track_expression(crop_track) if crop_track else None
-        if track_expr:
-            # Fase 5: dynamic crop pan follows speaker movement over time.
-            filters.append(f"crop=ih*9/16:ih:x='{track_expr}'")
-        elif crop_focus is None or not isinstance(crop_focus, (int, float)):
-            # Center crop to 9:16 vertical ratio (PRD OS-4)
-            filters.append("crop=ih*9/16:ih")
+        if reframe and reframe.mode == "simple":
+            filters.append(reframe.filter_expr)
         else:
-            # Fase 4 Iterasi 4.2: static smart crop on speaker face x-center
-            filters.append(f"crop=ih*9/16:ih:x='{crop_x_expression(crop_focus)}'")
+            # Legacy path (no reframe object provided).
+            track_expr = crop_track_expression(crop_track) if crop_track else None
+            if track_expr:
+                filters.append(f"crop=ih*9/16:ih:x='{track_expr}'")
+            elif crop_focus is None or not isinstance(crop_focus, (int, float)):
+                filters.append("crop=ih*9/16:ih")
+            else:
+                filters.append(f"crop=ih*9/16:ih:x='{crop_x_expression(crop_focus)}'")
 
-    # Subtitle burn-in filter (FR-9, AC-6)
     if subtitle_path:
         escaped_sub = escape_ffmpeg_subtitle_path(subtitle_path)
         filters.append(f"subtitles='{escaped_sub}'")
@@ -170,11 +200,8 @@ def build_ffmpeg_command(
         filter_str = ",".join(filters)
         cmd.extend(["-vf", filter_str, "-c:v", codec])
     else:
-        # Direct encode if no video filters
         cmd.extend(["-c:v", codec])
 
-    # EBU R128 loudness normalization for mobile & social feeds (Fase 1 Iterasi 1.2)
-    # Target: -16 LUFS integrated loudness, -1.5 dB True Peak, 11 LU loudness range
     if normalize_audio:
         cmd.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11", "-c:a", "aac"])
     else:
@@ -212,6 +239,7 @@ def render_clip(
     video_codec: str | None = None,
     crop_focus: float | None = None,
     crop_track: list[tuple[float, float]] | None = None,
+    reframe: ReframeResult | None = None,
 ) -> str:
     """Render a single video clip with frame accuracy, aspect ratio conversion, and optional subtitles.
 
@@ -226,6 +254,7 @@ def render_clip(
         video_codec: Explicit codec or None for auto-detect (Fase 3 Iterasi 3.3).
         crop_focus: Normalized face x-center for static smart 9:16 crop.
         crop_track: Time-varying face track for dynamic crop pan.
+        reframe: Layout-aware reframe result for complex filtergraphs.
 
     Returns:
         output_path
@@ -248,6 +277,7 @@ def render_clip(
         video_codec=video_codec,
         crop_focus=crop_focus,
         crop_track=crop_track,
+        reframe=reframe,
     )
 
     try:
@@ -301,6 +331,8 @@ def render_segments(
     smart_crop: bool = True,
     transcript: list[dict] | None = None,
     subtitle_style: SubtitleStyle | None = None,
+    reframe_mode: str = "auto",
+    burn_subtitles: bool = True,
 ) -> list[dict[str, Any]]:
     """Render all selected segments in requested output formats.
 
@@ -311,6 +343,11 @@ def render_segments(
     Args:
         transcript: Transcript with word timings; when provided, each clip gets
             its own karaoke .ass file with clip-relative timestamps.
+        reframe_mode: Reframing strategy for 9:16 output.
+            - 'auto': classify layout and pick the best strategy.
+            - 'center_crop': always center-crop (legacy behavior).
+            - 'speaker_focus': always zoom to active speaker.
+            - 'split_stack': always split and stack (podcast mode).
 
     Returns:
         List of dicts representing rendered clips matching PRD §8 Clip schema.
@@ -326,36 +363,113 @@ def render_segments(
     resolved_codec = resolve_video_codec(video_codec)
     workers = resolve_render_workers(resolved_codec)
 
-    # Plan every (segment, format) job first so results can be ordered stably,
-    # and so face detection / ASS writing happens once per segment.
     planned: list[dict[str, Any]] = []
     for seg_idx, seg in enumerate(segments):
         start = float(seg["start"])
         end = float(seg["end"])
 
-        # Fase 4/5: one face pass per segment (not per format).
+        # Per-segment: face detection, layout classification, reframe strategy.
         crop_focus: float | None = None
         crop_track: list[tuple[float, float]] | None = None
-        if smart_crop and "9:16" in output_formats:
-            focus = seg.get("crop_focus")
-            if isinstance(focus, (int, float)):
-                crop_focus = float(focus)
-            else:
-                crop_track = detect_face_track(video_path, start, end)
-                if not crop_track:
-                    crop_focus = detect_face_center(video_path, start, end)
+        reframe_result: ReframeResult | None = None
+        layout_label = "center-crop"
 
-        # Karaoke subtitle per clip (clip-relative timestamps).
-        clip_subtitle_path = subtitle_path
-        if transcript:
-            ass_path = os.path.join(output_dir, f"karaoke_{seg_idx + 1}.ass")
-            try:
-                clip_subtitle_path = transcript_to_ass_file(
-                    transcript, ass_path, segment_start=start, segment_end=end,
-                    style=subtitle_style,
+        if smart_crop and "9:16" in output_formats:
+            if reframe_mode == "center_crop":
+                # Legacy: force center crop, skip all detection.
+                pass
+            elif reframe_mode in ("auto", "speaker_focus", "split_stack"):
+                # Run layout classification for auto mode.
+                layout_info = classify_layout(video_path, start, end)
+                layout_label = layout_info.layout_type.value
+
+                # For non-single layouts, run active speaker detection.
+                if layout_info.layout_type not in (LayoutType.UNKNOWN, LayoutType.SINGLE_SPEAKER):
+                    try:
+                        from backend.pipeline.active_speaker import (
+                            build_face_tracks,
+                            identify_active_speaker,
+                            speaker_track_to_crop_focus,
+                        )
+                        from backend.pipeline.scene_classifier import _extract_faces, _open_detector, _sample_frames
+                        import cv2
+
+                        detector = _open_detector()
+                        if detector:
+                            per_frame = []
+                            with detector:
+                                for t, frame in _sample_frames(video_path, start, end, 10):
+                                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                    faces = _extract_faces(detector.process(rgb))
+                                    per_frame.append((t, faces))
+                            if per_frame:
+                                tracks = build_face_tracks(per_frame)
+                                if transcript and tracks:
+                                    events = identify_active_speaker(tracks, transcript, start, end)
+                                    crop_track = speaker_track_to_crop_focus(events, tracks, start)
+                                    active_idx = events[0].face_index if events else None
+                                else:
+                                    active_idx = 0
+                                    crop_track = None
+                        else:
+                            active_idx = None
+                    except (ImportError, Exception):
+                        active_idx = None
+                else:
+                    active_idx = None
+
+                # Override layout for forced modes.
+                if reframe_mode == "split_stack" and layout_info.layout_type != LayoutType.UNKNOWN:
+                    from backend.pipeline.scene_classifier import LayoutInfo as _LI
+                    layout_info = _LI(
+                        layout_type=LayoutType.SIDE_BY_SIDE,
+                        face_count=layout_info.face_count,
+                        face_regions=layout_info.face_regions,
+                    )
+
+                # Build the reframe filter.
+                reframe_result = build_reframe_filter(
+                    layout_info,
+                    crop_focus=crop_focus,
+                    crop_track=crop_track,
+                    active_face_index=active_idx if layout_info.layout_type == LayoutType.GRID else None,
+                    prefer_split_stack=(reframe_mode != "speaker_focus"),
                 )
-            except ValueError:
-                clip_subtitle_path = subtitle_path
+                layout_label = reframe_result.description or layout_info.layout_type.value
+            else:
+                # Fallback for unrecognized reframe_mode.
+                focus = seg.get("crop_focus")
+                if isinstance(focus, (int, float)):
+                    crop_focus = float(focus)
+                else:
+                    crop_track = detect_face_track(video_path, start, end)
+                    if not crop_track:
+                        crop_focus = detect_face_center(video_path, start, end)
+
+        # Sidecar SRT per clip (for native player / platform uploads).
+        sidecar_srt_path: str | None = None
+        if transcript:
+            srt_path = os.path.join(output_dir, f"clip_{seg_idx + 1}.srt")
+            try:
+                sidecar_srt_path = transcript_to_srt_file(
+                    transcript, srt_path, segment_start=start, segment_end=end
+                )
+            except Exception:
+                sidecar_srt_path = None
+
+        # Burn-in subtitle per clip (only when burn_subtitles is True).
+        clip_subtitle_path = None
+        if burn_subtitles:
+            clip_subtitle_path = subtitle_path
+            if transcript:
+                ass_path = os.path.join(output_dir, f"karaoke_{seg_idx + 1}.ass")
+                try:
+                    clip_subtitle_path = transcript_to_ass_file(
+                        transcript, ass_path, segment_start=start, segment_end=end,
+                        style=subtitle_style,
+                    )
+                except ValueError:
+                    clip_subtitle_path = subtitle_path
 
         for fmt in output_formats:
             fmt_slug = fmt.replace(":", "x")
@@ -368,8 +482,11 @@ def render_segments(
                 "clip_id": str(uuid.uuid4()),
                 "output_file": os.path.join(output_dir, f"clip_{seg_idx + 1}_{fmt_slug}.mp4"),
                 "subtitle_path": clip_subtitle_path,
+                "sidecar_srt": sidecar_srt_path,
                 "crop_focus": crop_focus if fmt == "9:16" else None,
                 "crop_track": crop_track if fmt == "9:16" else None,
+                "reframe": reframe_result if fmt == "9:16" else None,
+                "layout_label": layout_label if fmt == "9:16" else "native",
             })
 
     def _render_one(item: dict[str, Any]) -> tuple[dict[str, Any], Exception | None]:
@@ -385,9 +502,10 @@ def render_segments(
                 video_codec=video_codec,
                 crop_focus=item["crop_focus"],
                 crop_track=item["crop_track"],
+                reframe=item.get("reframe"),
             )
             return item, None
-        except Exception as exc:  # one bad clip must not abort the batch
+        except Exception as exc:
             return item, exc
 
     if workers > 1 and len(planned) > 1:
@@ -411,12 +529,13 @@ def render_segments(
             "format": item["format"],
             "file_path": item["output_file"],
             "subtitle_burned": bool(clip_subtitle_path and os.path.isfile(clip_subtitle_path)),
+            "subtitle_file": item.get("sidecar_srt"),
             "audio_normalized": normalize_audio,
             "video_codec": resolved_codec,
             "crop_focus": item["crop_focus"],
             "crop_track_windows": len(item["crop_track"]) if item["crop_track"] else 0,
+            "layout_type": item.get("layout_label", "unknown"),
             "karaoke": bool(clip_subtitle_path and clip_subtitle_path.lower().endswith(".ass")),
-            # Fase 3 Iterasi 3.2: carry virality metadata from segment through render.
             "virality_score": seg.get("virality_score"),
             "hook": seg.get("hook", ""),
             "caption": seg.get("caption", ""),

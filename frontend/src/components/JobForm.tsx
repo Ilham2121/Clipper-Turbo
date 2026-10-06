@@ -100,6 +100,7 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
       youtubeUrl: trimmedUrl,
       selectionMode: mode,
       outputFormats: aspectRatios,
+      burnSubtitles: burnSubtitles,
     };
 
     if (mode === 'auto') {
@@ -361,7 +362,7 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
             <div>
               <strong>9:16 Vertikal</strong>
               <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                Shorts, Reels, TikTok (Center Crop)
+                Shorts, Reels, TikTok (Smart Reframe)
               </div>
             </div>
           </label>

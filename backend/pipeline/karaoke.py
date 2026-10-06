@@ -222,3 +222,73 @@ def transcript_to_ass_file(
 def has_word_timestamps(transcript: list[dict]) -> bool:
     """True when every segment carries non-empty word timestamps."""
     return bool(transcript) and all(seg.get("words") for seg in transcript)
+
+
+def _srt_timestamp(seconds: float) -> str:
+    """Format seconds as SRT timestamp HH:MM:SS,mmm."""
+    total_ms = max(0, int(round(seconds * 1000)))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def build_srt(
+    transcript: list[dict],
+    segment_start: float = 0.0,
+    segment_end: float | None = None,
+    max_words: int = 6,
+) -> str:
+    """Build standard SubRip (.srt) subtitle text for a clip."""
+    offset = float(segment_start or 0.0)
+    clip_end = None if segment_end is None else float(segment_end)
+    words = _collect_words(transcript, offset, clip_end)
+    if not words:
+        cues: list[tuple[float, float, str]] = []
+        for seg in transcript:
+            s = float(seg.get("start", 0.0))
+            e = float(seg.get("end", s))
+            if clip_end is not None and (e <= offset or s >= clip_end):
+                continue
+            text = str(seg.get("text", "")).strip()
+            if text:
+                c_start = max(0.0, s - offset)
+                c_end = max(c_start + 0.2, (e - offset) if clip_end is None else min(e - offset, clip_end - offset))
+                cues.append((c_start, c_end, text))
+        if not cues:
+            return ""
+        lines: list[str] = []
+        for i, (cs, ce, txt) in enumerate(cues, start=1):
+            lines.append(f"{i}\n{_srt_timestamp(cs)} --> {_srt_timestamp(ce)}\n{txt}\n")
+        return "\n".join(lines)
+
+    blocks = _chunk_words(words, max_words)
+    lines_out: list[str] = []
+    for idx, block in enumerate(blocks, start=1):
+        start = block[0]["start"]
+        end = block[-1]["end"]
+        if end <= start:
+            end = start + 0.5
+        text = " ".join(w["word"] for w in block)
+        lines_out.append(f"{idx}\n{_srt_timestamp(start)} --> {_srt_timestamp(end)}\n{text}\n")
+    return "\n".join(lines_out)
+
+
+def transcript_to_srt_file(
+    transcript: list[dict],
+    output_path: str,
+    segment_start: float = 0.0,
+    segment_end: float | None = None,
+    max_words: int = 6,
+) -> str | None:
+    """Write sidecar SRT file for a clip. Returns output_path if content was written, else None."""
+    content = build_srt(transcript, segment_start, segment_end, max_words)
+    if not content.strip():
+        return None
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return output_path
+

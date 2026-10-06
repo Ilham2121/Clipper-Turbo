@@ -39,6 +39,7 @@ class CreateJobRequest(BaseModel):
     llm_model: str | None = Field(None, alias="llmModel")
     llm_base_url: str | None = Field(None, alias="llmBaseUrl")
     output_formats: list[Literal["9:16", "16:9"]] = Field(..., alias="outputFormats")
+    burn_subtitles: bool = Field(True, alias="burnSubtitles")
 
     @field_validator("youtube_url")
     @classmethod
@@ -82,6 +83,7 @@ def build_job_payload(
     manual_segments: list[dict[str, Any]] | None = None,
     llm_provider: str | None = None,
     llm_api_key: str | None = None,
+    burn_subtitles: bool = True,
 ) -> dict[str, Any]:
     """Build a clean request payload for POST /api/jobs containing only mode-relevant fields.
 
@@ -91,6 +93,7 @@ def build_job_payload(
         "youtubeUrl": youtube_url,
         "selectionMode": selection_mode,
         "outputFormats": output_formats,
+        "burnSubtitles": burn_subtitles,
     }
 
     if selection_mode == "manual":
@@ -148,6 +151,7 @@ class ClipInfo(BaseModel):
     segment_end: float = Field(..., alias="segmentEnd")
     format: Literal["9:16", "16:9"]
     download_url: str = Field(..., alias="downloadUrl")
+    subtitle_url: str | None = Field(None, alias="subtitleUrl")
     # Fase 3 Iterasi 3.2: optional virality metadata (None/absent for old/manual clips).
     virality_score: int | None = Field(None, alias="viralityScore")
     hook: str | None = Field(None, alias="hook")

@@ -131,9 +131,11 @@ def run_pipeline(
                 _log(f"Ditemukan {len(segments)} segmen kandidat{best}")
 
             # Stage 3 (cont.): subtitle source selection
-            # Karaoke needs word timings; VTT-only transcripts stay static.
+            burn_subtitles = getattr(request, "burn_subtitles", True)
             karaoke_ready = bool(transcript) and any(seg.get("words") for seg in transcript)
-            if karaoke_ready:
+            if not burn_subtitles:
+                _log("Subtitle burn-in dinonaktifkan oleh user")
+            elif karaoke_ready:
                 _log("Subtitle karaoke akan dibuat per klip dari word timestamps ASR")
             elif subtitle_path:
                 _log("Subtitle statis (VTT YouTube, sudah de-duplikasi) dipakai untuk burn-in")
@@ -150,33 +152,37 @@ def run_pipeline(
                 segments=segments,
                 output_dir=clips_dir,
                 output_formats=request.output_formats,
-                subtitle_path=subtitle_path,
-                transcript=transcript if karaoke_ready else None,
+                subtitle_path=subtitle_path if burn_subtitles else None,
+                transcript=transcript,
                 subtitle_style=SubtitleStyle.from_dict(
                     db.get_setting(SUBTITLE_SETTINGS_KEY)
                 ),
+                burn_subtitles=burn_subtitles,
             )
             for i, c in enumerate(rendered_clips, start=1):
                 sub = "karaoke" if c.get("karaoke") else ("subtitle" if c.get("subtitle_burned") else "tanpa subtitle")
-                crop = "smart-crop" if c.get("crop_focus") is not None else "center-crop"
+                layout = c.get("layout_type", "center-crop")
                 _log(
                     f"Klip {i}/{len(rendered_clips)} selesai "
                     f"[{c.get('format')}] {c.get('segment_start', 0):.0f}-{c.get('segment_end', 0):.0f}s "
                     f"({c.get('video_codec', '?')}, {sub}"
-                    + (f", {crop}" if c.get("format") == "9:16" else "")
+                    + (f", {layout}" if c.get("format") == "9:16" else "")
                     + ")"
                 )
 
             # Stage 5: Deliver / Completed
             formatted_clips: list[dict[str, Any]] = []
             for c in rendered_clips:
+                sub_url = f"/api/clips/{c['id']}/subtitles" if c.get("subtitle_file") else None
                 formatted_clips.append({
                     "id": c["id"],
                     "segmentStart": c.get("segment_start", 0.0),
                     "segmentEnd": c.get("segment_end", 0.0),
                     "format": c["format"],
                     "downloadUrl": f"/api/clips/{c['id']}",
+                    "subtitleUrl": sub_url,
                     "filePath": c.get("file_path", ""),
+                    "subtitlePath": c.get("subtitle_file", ""),
                     # Fase 3 Iterasi 3.2: virality metadata (.get for old/manual segments).
                     "viralityScore": c.get("virality_score"),
                     "hook": c.get("hook", ""),

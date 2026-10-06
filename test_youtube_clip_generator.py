@@ -334,6 +334,7 @@ class TestAcceptanceCriteria:
                         segments=segments,
                         output_dir=str(tmp_path / "dual_clips"),
                         output_formats=["9:16", "16:9"],
+                        reframe_mode="center_crop",
                     )
 
         assert len(clips) == 2
@@ -1643,6 +1644,7 @@ class TestSpeakerTracking:
                     segments=[{"start": 0.0, "end": 5.0}],
                     output_dir=str(tmp_path / "clips"),
                     output_formats=["9:16", "16:9"],
+                    reframe_mode="legacy",
                 )
         by_fmt = {c["format"]: c for c in clips}
         assert by_fmt["9:16"].get("crop_focus") == 0.75
@@ -2230,6 +2232,7 @@ class TestDynamicCrop:
                     segments=[{"start": 0.0, "end": 5.0}],
                     output_dir=str(tmp_path / "clips"),
                     output_formats=["9:16", "16:9"],
+                    reframe_mode="legacy",
                 )
         by_fmt = {c["format"]: c for c in clips}
         assert by_fmt["9:16"]["crop_track_windows"] == 3
@@ -2624,4 +2627,637 @@ class TestSubtitleRework:
         dialogues = [ln for ln in content.splitlines() if ln.startswith("Dialogue:")]
         assert len(dialogues) == 3, "6 words / 2 per block = 3 events"
 
+
+# ---------------------------------------------------------------------------
+# Fase A Iterasi A.1 — Scene Layout Classifier
+# ---------------------------------------------------------------------------
+
+from backend.pipeline.scene_classifier import (
+    FaceRegion,
+    LayoutInfo,
+    LayoutType,
+    classify_layout_from_faces,
+    _horizontal_spread,
+    _area_ratio,
+    _is_corner,
+    _median_face_count,
+)
+
+
+class TestFaceRegionProperties:
+    """FaceRegion computed properties."""
+
+    def test_center_and_area(self):
+        f = FaceRegion(x_min=0.2, y_min=0.3, width=0.1, height=0.2)
+        assert abs(f.x_center - 0.25) < 1e-6
+        assert abs(f.y_center - 0.4) < 1e-6
+        assert abs(f.area - 0.02) < 1e-6
+
+
+class TestHelperFunctions:
+    """Low-level spatial analysis helpers."""
+
+    def test_horizontal_spread_single_face(self):
+        faces = [FaceRegion(0.4, 0.3, 0.2, 0.3)]
+        assert _horizontal_spread(faces) == 0.0
+
+    def test_horizontal_spread_two_faces(self):
+        left = FaceRegion(0.1, 0.3, 0.15, 0.3)
+        right = FaceRegion(0.7, 0.3, 0.15, 0.3)
+        spread = _horizontal_spread([left, right])
+        assert spread > 0.5, f"Expected wide spread, got {spread}"
+
+    def test_area_ratio_equal(self):
+        a = FaceRegion(0.1, 0.2, 0.2, 0.3)
+        b = FaceRegion(0.6, 0.2, 0.2, 0.3)
+        assert abs(_area_ratio([a, b]) - 1.0) < 1e-6
+
+    def test_area_ratio_unequal(self):
+        big = FaceRegion(0.2, 0.2, 0.3, 0.4)
+        small = FaceRegion(0.75, 0.75, 0.05, 0.05)
+        ratio = _area_ratio([big, small])
+        assert ratio < 0.1, f"Expected low ratio for size mismatch, got {ratio}"
+
+    def test_is_corner_top_left(self):
+        f = FaceRegion(x_min=0.0, y_min=0.0, width=0.1, height=0.1)
+        assert _is_corner(f)
+
+    def test_is_corner_bottom_right(self):
+        f = FaceRegion(x_min=0.85, y_min=0.85, width=0.1, height=0.1)
+        assert _is_corner(f)
+
+    def test_not_corner_center(self):
+        f = FaceRegion(x_min=0.35, y_min=0.35, width=0.2, height=0.2)
+        assert not _is_corner(f)
+
+    def test_median_face_count(self):
+        frames = [
+            [FaceRegion(0.1, 0.1, 0.1, 0.1)],  # 1
+            [FaceRegion(0.1, 0.1, 0.1, 0.1), FaceRegion(0.5, 0.1, 0.1, 0.1)],  # 2
+            [FaceRegion(0.1, 0.1, 0.1, 0.1), FaceRegion(0.5, 0.1, 0.1, 0.1)],  # 2
+            [FaceRegion(0.1, 0.1, 0.1, 0.1), FaceRegion(0.5, 0.1, 0.1, 0.1)],  # 2
+            [],  # 0 (outlier)
+        ]
+        assert _median_face_count(frames) == 2
+
+    def test_median_face_count_empty(self):
+        assert _median_face_count([]) == 0
+
+
+class TestLayoutClassification:
+    """classify_layout_from_faces() — deterministic, no video I/O."""
+
+    def test_no_faces_returns_unknown(self):
+        info = classify_layout_from_faces([], face_count=0)
+        assert info.layout_type == LayoutType.UNKNOWN
+
+    def test_single_speaker_center(self):
+        """One large face near center → single_speaker."""
+        face = FaceRegion(x_min=0.35, y_min=0.2, width=0.3, height=0.4)
+        info = classify_layout_from_faces([face])
+        assert info.layout_type == LayoutType.SINGLE_SPEAKER
+        assert info.face_count == 1
+        assert info.confidence >= 0.8
+
+    def test_gameplay_small_corner_face(self):
+        """One tiny face in a corner → gameplay."""
+        face = FaceRegion(x_min=0.85, y_min=0.75, width=0.1, height=0.1)
+        assert face.area < 0.03
+        info = classify_layout_from_faces([face])
+        assert info.layout_type == LayoutType.GAMEPLAY
+
+    def test_side_by_side_podcast(self):
+        """Two same-size faces spread horizontally → side_by_side."""
+        left = FaceRegion(x_min=0.1, y_min=0.3, width=0.15, height=0.25)
+        right = FaceRegion(x_min=0.7, y_min=0.3, width=0.15, height=0.25)
+        info = classify_layout_from_faces([left, right])
+        assert info.layout_type == LayoutType.SIDE_BY_SIDE
+        assert info.face_count == 2
+
+    def test_pip_reaction(self):
+        """Two faces, one much smaller and in a corner → pip."""
+        main = FaceRegion(x_min=0.3, y_min=0.2, width=0.3, height=0.4)
+        reactor = FaceRegion(x_min=0.85, y_min=0.75, width=0.08, height=0.08)
+        info = classify_layout_from_faces([main, reactor])
+        assert info.layout_type == LayoutType.PIP
+        assert info.face_count == 2
+
+    def test_two_close_faces_as_single_speaker(self):
+        """Two faces close together (interview tight shot) → single_speaker fallback."""
+        a = FaceRegion(x_min=0.35, y_min=0.2, width=0.12, height=0.2)
+        b = FaceRegion(x_min=0.52, y_min=0.2, width=0.12, height=0.2)
+        info = classify_layout_from_faces([a, b])
+        assert info.layout_type == LayoutType.SINGLE_SPEAKER
+        assert info.face_count == 2
+
+    def test_grid_three_faces(self):
+        """Three or more faces → grid."""
+        faces = [
+            FaceRegion(x_min=0.05, y_min=0.05, width=0.15, height=0.2),
+            FaceRegion(x_min=0.55, y_min=0.05, width=0.15, height=0.2),
+            FaceRegion(x_min=0.05, y_min=0.55, width=0.15, height=0.2),
+        ]
+        info = classify_layout_from_faces(faces)
+        assert info.layout_type == LayoutType.GRID
+        assert info.face_count == 3
+
+    def test_grid_four_faces(self):
+        """Four faces in a 2x2 grid → grid."""
+        faces = [
+            FaceRegion(x_min=0.05, y_min=0.05, width=0.15, height=0.2),
+            FaceRegion(x_min=0.55, y_min=0.05, width=0.15, height=0.2),
+            FaceRegion(x_min=0.05, y_min=0.55, width=0.15, height=0.2),
+            FaceRegion(x_min=0.55, y_min=0.55, width=0.15, height=0.2),
+        ]
+        info = classify_layout_from_faces(faces)
+        assert info.layout_type == LayoutType.GRID
+        assert info.face_count == 4
+
+    def test_speaker_regions_populated(self):
+        """All layout types populate speaker_regions with bounding boxes."""
+        face = FaceRegion(x_min=0.4, y_min=0.3, width=0.2, height=0.3)
+        info = classify_layout_from_faces([face])
+        assert len(info.speaker_regions) == 1
+        x, y, w, h = info.speaker_regions[0]
+        assert abs(x - 0.4) < 1e-6
+        assert abs(w - 0.2) < 1e-6
+
+    def test_layout_info_defaults(self):
+        info = LayoutInfo(layout_type=LayoutType.UNKNOWN, face_count=0)
+        assert info.face_regions == []
+        assert info.speaker_regions == []
+        assert info.confidence == 0.0
+
+    def test_face_count_override(self):
+        """face_count parameter overrides len(faces) for median-based calls."""
+        face = FaceRegion(x_min=0.4, y_min=0.3, width=0.2, height=0.3)
+        info = classify_layout_from_faces([face], face_count=0)
+        assert info.layout_type == LayoutType.UNKNOWN
+
+    def test_classify_layout_unavailable_deps(self):
+        """classify_layout with missing cv2/mediapipe returns UNKNOWN gracefully."""
+        with patch("backend.pipeline.scene_classifier._open_detector", return_value=None):
+            from backend.pipeline.scene_classifier import classify_layout
+            result = classify_layout("nonexistent.mp4", 0.0, 10.0)
+            assert result.layout_type == LayoutType.UNKNOWN
+
+
+# ---------------------------------------------------------------------------
+# Fase A Iterasi A.2 — Active Speaker Detection
+# ---------------------------------------------------------------------------
+
+from backend.pipeline.active_speaker import (
+    FaceTrack,
+    SpeakerEvent,
+    _bbox_variance,
+    _bbox_height_variance,
+    _combined_motion,
+    _find_speech_windows,
+    build_face_tracks,
+    identify_active_speaker,
+    speaker_track_to_crop_focus,
+)
+
+
+class TestBboxMotionMetrics:
+    """Low-level face motion measurement."""
+
+    def test_variance_single_region(self):
+        r = FaceRegion(0.4, 0.3, 0.2, 0.3)
+        assert _bbox_variance([r]) == 0.0
+
+    def test_variance_identical_regions(self):
+        r = FaceRegion(0.4, 0.3, 0.2, 0.3)
+        assert _bbox_variance([r, r, r]) == 0.0
+
+    def test_variance_moving_face(self):
+        """Face that shifts vertically should have nonzero variance."""
+        regions = [
+            FaceRegion(0.4, 0.30, 0.2, 0.3),
+            FaceRegion(0.4, 0.35, 0.2, 0.3),
+            FaceRegion(0.4, 0.28, 0.2, 0.3),
+        ]
+        assert _bbox_variance(regions) > 0
+
+    def test_height_variance_mouth_opening(self):
+        """Simulated mouth opening changes bbox height."""
+        still = [FaceRegion(0.4, 0.3, 0.2, 0.30)] * 3
+        assert _bbox_height_variance(still) == 0.0
+
+        talking = [
+            FaceRegion(0.4, 0.3, 0.2, 0.30),
+            FaceRegion(0.4, 0.3, 0.2, 0.33),
+            FaceRegion(0.4, 0.3, 0.2, 0.28),
+        ]
+        assert _bbox_height_variance(talking) > 0
+
+    def test_combined_motion_positive(self):
+        regions = [
+            FaceRegion(0.4, 0.30, 0.2, 0.30),
+            FaceRegion(0.4, 0.35, 0.2, 0.33),
+        ]
+        assert _combined_motion(regions) > 0
+
+
+class TestSpeechWindows:
+    """_find_speech_windows correctly chunks speech into time windows."""
+
+    def test_basic_windows(self):
+        transcript = [
+            {"start": 10.0, "end": 12.0, "text": "hello", "words": [
+                {"start": 10.0, "end": 10.5, "word": "hello"},
+            ]},
+            {"start": 14.0, "end": 15.0, "text": "world", "words": [
+                {"start": 14.0, "end": 14.5, "word": "world"},
+            ]},
+        ]
+        windows = _find_speech_windows(transcript, segment_start=10.0, segment_end=20.0, window_sec=2.0)
+        assert len(windows) > 0
+        assert windows[0][0] == 0.0
+
+    def test_empty_transcript(self):
+        assert _find_speech_windows([], 0.0, 10.0) == []
+
+    def test_no_words_in_range(self):
+        transcript = [{"start": 50.0, "end": 51.0, "text": "far away"}]
+        assert _find_speech_windows(transcript, 0.0, 10.0) == []
+
+
+class TestFaceTrackBuilding:
+    """build_face_tracks groups per-frame detections into persistent tracks."""
+
+    def test_single_face_tracked(self):
+        frames = [
+            (0.0, [FaceRegion(0.4, 0.3, 0.2, 0.3)]),
+            (1.0, [FaceRegion(0.41, 0.3, 0.2, 0.3)]),
+            (2.0, [FaceRegion(0.39, 0.3, 0.2, 0.3)]),
+        ]
+        tracks = build_face_tracks(frames)
+        assert len(tracks) == 1
+        assert len(tracks[0].snapshots) == 3
+
+    def test_two_faces_tracked_separately(self):
+        frames = [
+            (0.0, [FaceRegion(0.1, 0.3, 0.15, 0.25), FaceRegion(0.7, 0.3, 0.15, 0.25)]),
+            (1.0, [FaceRegion(0.11, 0.3, 0.15, 0.25), FaceRegion(0.71, 0.3, 0.15, 0.25)]),
+        ]
+        tracks = build_face_tracks(frames)
+        assert len(tracks) == 2
+        # Each track should have 2 snapshots
+        for t in tracks:
+            assert len(t.snapshots) == 2
+
+    def test_empty_input(self):
+        assert build_face_tracks([]) == []
+
+
+class TestActiveSpeakerIdentification:
+    """identify_active_speaker picks the most-moving face during speech."""
+
+    def _make_tracks(self):
+        """Two face tracks: track 0 is still, track 1 is moving (talking)."""
+        still = FaceTrack(face_index=0, snapshots=[
+            (10.0, 0.0, FaceRegion(0.1, 0.3, 0.15, 0.25)),
+            (11.0, 1.0, FaceRegion(0.1, 0.3, 0.15, 0.25)),
+            (12.0, 2.0, FaceRegion(0.1, 0.3, 0.15, 0.25)),
+        ])
+        talking = FaceTrack(face_index=1, snapshots=[
+            (10.0, 0.0, FaceRegion(0.7, 0.30, 0.15, 0.25)),
+            (11.0, 1.0, FaceRegion(0.7, 0.35, 0.15, 0.28)),
+            (12.0, 2.0, FaceRegion(0.7, 0.28, 0.15, 0.23)),
+        ])
+        return [still, talking]
+
+    def test_picks_moving_face(self):
+        tracks = self._make_tracks()
+        transcript = [{"start": 10.0, "end": 13.0, "text": "speaking",
+                        "words": [{"start": 10.5, "end": 11.0, "word": "speaking"}]}]
+        events = identify_active_speaker(tracks, transcript, 10.0, 13.0, window_sec=3.0)
+        assert len(events) >= 1
+        assert events[0].face_index == 1, "Should pick the moving/talking face"
+
+    def test_empty_tracks(self):
+        assert identify_active_speaker([], [{"start": 0, "end": 1, "text": "x"}], 0, 1) == []
+
+    def test_empty_transcript(self):
+        track = FaceTrack(face_index=0, snapshots=[(0.0, 0.0, FaceRegion(0.4, 0.3, 0.2, 0.3))])
+        assert identify_active_speaker([track], [], 0, 10) == []
+
+
+class TestSpeakerTrackToCropFocus:
+    """speaker_track_to_crop_focus bridges to the existing crop_track_expression format."""
+
+    def test_converts_events_to_crop_pairs(self):
+        track = FaceTrack(face_index=0, snapshots=[
+            (5.0, 0.0, FaceRegion(0.3, 0.2, 0.2, 0.3)),
+            (6.0, 1.0, FaceRegion(0.32, 0.2, 0.2, 0.3)),
+        ])
+        events = [SpeakerEvent(time=0.0, face_index=0, confidence=0.8)]
+        pairs = speaker_track_to_crop_focus(events, [track], segment_start=5.0)
+        assert len(pairs) == 1
+        t, x = pairs[0]
+        assert t == 0.0
+        assert 0.3 <= x <= 0.5
+
+    def test_empty_input(self):
+        assert speaker_track_to_crop_focus([], [], 0.0) == []
+
+
+# ---------------------------------------------------------------------------
+# Fase B — Reframing Strategies
+# ---------------------------------------------------------------------------
+
+from backend.pipeline.reframe import (
+    ReframeResult,
+    build_reframe_filter,
+)
+
+
+class TestReframeStrategies:
+    """build_reframe_filter dispatches correctly per layout type."""
+
+    def test_single_speaker_center_crop(self):
+        layout = LayoutInfo(layout_type=LayoutType.SINGLE_SPEAKER, face_count=1,
+                            face_regions=[FaceRegion(0.4, 0.3, 0.2, 0.3)])
+        result = build_reframe_filter(layout)
+        assert result.mode == "simple"
+        assert "crop=" in result.filter_expr
+        assert "center crop" in result.description
+
+    def test_single_speaker_smart_crop(self):
+        layout = LayoutInfo(layout_type=LayoutType.SINGLE_SPEAKER, face_count=1,
+                            face_regions=[FaceRegion(0.3, 0.3, 0.2, 0.3)])
+        result = build_reframe_filter(layout, crop_focus=0.35)
+        assert result.mode == "simple"
+        assert "0.35" in result.filter_expr or "crop" in result.filter_expr
+        assert "static smart crop" in result.description
+
+    def test_single_speaker_dynamic_pan(self):
+        layout = LayoutInfo(layout_type=LayoutType.SINGLE_SPEAKER, face_count=1,
+                            face_regions=[FaceRegion(0.3, 0.3, 0.2, 0.3)])
+        track = [(0.0, 0.3), (2.0, 0.6)]
+        result = build_reframe_filter(layout, crop_track=track)
+        assert result.mode == "simple"
+        assert "dynamic pan" in result.description
+
+    def test_side_by_side_split_stack(self):
+        left = FaceRegion(0.1, 0.3, 0.15, 0.25)
+        right = FaceRegion(0.7, 0.3, 0.15, 0.25)
+        layout = LayoutInfo(layout_type=LayoutType.SIDE_BY_SIDE, face_count=2,
+                            face_regions=[left, right])
+        result = build_reframe_filter(layout, prefer_split_stack=True)
+        assert result.mode == "complex"
+        assert "vstack" in result.filter_expr
+        assert result.output_label == "[out]"
+        assert "split-stack" in result.description
+
+    def test_side_by_side_speaker_focus(self):
+        left = FaceRegion(0.1, 0.3, 0.15, 0.25)
+        right = FaceRegion(0.7, 0.3, 0.15, 0.25)
+        layout = LayoutInfo(layout_type=LayoutType.SIDE_BY_SIDE, face_count=2,
+                            face_regions=[left, right])
+        track = [(0.0, 0.15), (3.0, 0.75)]
+        result = build_reframe_filter(layout, crop_track=track, prefer_split_stack=False)
+        assert result.mode == "simple"
+        assert "speaker-focus" in result.description
+
+    def test_pip_compose(self):
+        main = FaceRegion(0.3, 0.2, 0.3, 0.4)
+        reactor = FaceRegion(0.85, 0.75, 0.08, 0.08)
+        layout = LayoutInfo(layout_type=LayoutType.PIP, face_count=2,
+                            face_regions=[main, reactor])
+        result = build_reframe_filter(layout)
+        assert result.mode == "complex"
+        assert "vstack" in result.filter_expr
+        assert "[main]" in result.filter_expr
+        assert "[reactor]" in result.filter_expr
+        assert "pip" in result.description
+
+    def test_pip_fallback_insufficient_faces(self):
+        layout = LayoutInfo(layout_type=LayoutType.PIP, face_count=1,
+                            face_regions=[FaceRegion(0.4, 0.3, 0.2, 0.3)])
+        result = build_reframe_filter(layout)
+        assert result.mode == "simple"
+        assert "fallback" in result.description
+
+    def test_grid_zoom_active(self):
+        faces = [
+            FaceRegion(0.1, 0.1, 0.15, 0.2),
+            FaceRegion(0.6, 0.1, 0.15, 0.2),
+            FaceRegion(0.1, 0.6, 0.15, 0.2),
+        ]
+        layout = LayoutInfo(layout_type=LayoutType.GRID, face_count=3,
+                            face_regions=faces)
+        result = build_reframe_filter(layout, active_face_index=1)
+        assert result.mode == "simple"
+        assert "grid" in result.description
+        assert "face 1" in result.description
+
+    def test_grid_default_face_zero(self):
+        faces = [FaceRegion(0.3, 0.3, 0.15, 0.2)]
+        layout = LayoutInfo(layout_type=LayoutType.GRID, face_count=3,
+                            face_regions=faces)
+        result = build_reframe_filter(layout)
+        assert "face 0" in result.description
+
+    def test_gameplay_stack(self):
+        cam = FaceRegion(0.85, 0.75, 0.1, 0.1)
+        layout = LayoutInfo(layout_type=LayoutType.GAMEPLAY, face_count=1,
+                            face_regions=[cam])
+        result = build_reframe_filter(layout)
+        assert result.mode == "complex"
+        assert "vstack" in result.filter_expr
+        assert "[game]" in result.filter_expr
+        assert "[cam]" in result.filter_expr
+        assert "gameplay" in result.description
+
+    def test_unknown_center_crop(self):
+        layout = LayoutInfo(layout_type=LayoutType.UNKNOWN, face_count=0)
+        result = build_reframe_filter(layout)
+        assert result.mode == "simple"
+        assert "crop=ih*9/16:ih" == result.filter_expr
+        assert "center crop" in result.description
+
+    def test_reframe_result_dataclass(self):
+        r = ReframeResult(mode="simple", filter_expr="crop=ih*9/16:ih")
+        assert r.output_label == ""
+        assert r.description == ""
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Burn-in Subtitles Toggle & Sidecar SRT Tests
+# ---------------------------------------------------------------------------
+
+
+class TestPhase1BurnInToggleAndSidecar:
+    """Tests verifying the burn-in subtitle toggle bug fix and sidecar SRT export."""
+
+    def test_schema_burn_subtitles_default_true(self):
+        """CreateJobRequest defaults burn_subtitles to True (backward compatibility)."""
+        from backend.api.schemas import CreateJobRequest
+        req = CreateJobRequest(
+            youtubeUrl="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            selectionMode="manual",
+            manualSegments=[{"start": 0.0, "end": 10.0}],
+            outputFormats=["9:16"],
+        )
+        assert req.burn_subtitles is True
+
+    def test_schema_burn_subtitles_explicit_false(self):
+        """CreateJobRequest correctly accepts burnSubtitles=False."""
+        from backend.api.schemas import CreateJobRequest
+        req = CreateJobRequest(
+            youtubeUrl="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            selectionMode="manual",
+            manualSegments=[{"start": 0.0, "end": 10.0}],
+            outputFormats=["9:16"],
+            burnSubtitles=False,
+        )
+        assert req.burn_subtitles is False
+
+    def test_build_job_payload_includes_burn_subtitles(self):
+        """build_job_payload includes burnSubtitles flag."""
+        from backend.api.schemas import build_job_payload
+        payload = build_job_payload(
+            youtube_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            selection_mode="manual",
+            output_formats=["9:16"],
+            manual_segments=[{"start": 0.0, "end": 10.0}],
+            burn_subtitles=False,
+        )
+        assert payload.get("burnSubtitles") is False
+
+    def test_build_ffmpeg_command_no_subtitles_filter(self):
+        """When subtitle_path is None, no subtitle filter appears in simple or complex FFmpeg command."""
+        from backend.pipeline.render import build_ffmpeg_command
+        cmd = build_ffmpeg_command(
+            video_path="dummy.mp4",
+            start=0.0,
+            end=10.0,
+            output_path="out.mp4",
+            format_ratio="9:16",
+            subtitle_path=None,
+        )
+        cmd_str = " ".join(cmd)
+        assert "subtitles=" not in cmd_str
+
+    def test_render_segments_burn_disabled_ignores_transcript_and_burn(self, tmp_path):
+        """When burn_subtitles=False, no subtitle filter is burned in even if transcript is provided."""
+        from unittest.mock import patch
+        from backend.pipeline.render import render_segments
+
+        dummy_video = tmp_path / "dummy.mp4"
+        dummy_video.write_bytes(b"dummy video data")
+
+        segments = [{"start": 0.0, "end": 5.0}]
+        transcript = [
+            {
+                "start": 0.0,
+                "end": 5.0,
+                "text": "Halo dunia",
+                "words": [
+                    {"word": "Halo", "start": 0.0, "end": 2.0},
+                    {"word": "dunia", "start": 2.0, "end": 4.0},
+                ],
+            }
+        ]
+
+        with patch("subprocess.run") as mock_sub:
+            mock_sub.return_value.returncode = 0
+            mock_sub.return_value.stderr = ""
+            mock_sub.return_value.stdout = ""
+
+            clips = render_segments(
+                video_path=str(dummy_video),
+                segments=segments,
+                output_dir=str(tmp_path / "clips"),
+                output_formats=["9:16"],
+                transcript=transcript,
+                reframe_mode="center_crop",
+                burn_subtitles=False,
+            )
+
+            assert len(clips) == 1
+            assert clips[0]["subtitle_burned"] is False
+            assert clips[0]["karaoke"] is False
+            # Verify sidecar SRT was created
+            assert clips[0].get("subtitle_file") is not None
+            assert os.path.isfile(clips[0]["subtitle_file"])
+
+            # Verify FFmpeg call did NOT include subtitles
+            call_args = mock_sub.call_args[0][0]
+            assert not any("subtitles=" in arg for arg in call_args)
+
+    def test_pipeline_burn_disabled_passes_flag(self, tmp_path):
+        """run_pipeline respects burn_subtitles=False and logs warning."""
+        from unittest.mock import MagicMock, patch
+        from backend.api.schemas import CreateJobRequest
+        from backend.models.db import db
+        from backend.pipeline.pipeline import run_pipeline
+
+        job_id = "test-burn-disabled-job"
+        req = CreateJobRequest(
+            youtubeUrl="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            selectionMode="manual",
+            manualSegments=[{"start": 0.0, "end": 5.0}],
+            outputFormats=["9:16"],
+            burnSubtitles=False,
+        )
+        db.create_job(job_id=job_id, youtube_url=req.youtube_url, selection_mode=req.selection_mode)
+
+        with patch("backend.pipeline.pipeline.download_video") as mock_dl, \
+             patch("backend.pipeline.pipeline.transcribe") as mock_tr, \
+             patch("backend.pipeline.pipeline.render_segments") as mock_render:
+
+            mock_dl.return_value = {
+                "video_path": str(tmp_path / "dummy.mp4"),
+                "subtitle_path": str(tmp_path / "dummy.vtt"),
+                "duration": 10.0,
+                "title": "Test Video",
+            }
+            mock_tr.return_value = [{"start": 0.0, "end": 5.0, "text": "Test"}]
+            mock_render.return_value = [
+                {
+                    "id": "clip-1",
+                    "segment_start": 0.0,
+                    "segment_end": 5.0,
+                    "format": "9:16",
+                    "file_path": str(tmp_path / "clip-1.mp4"),
+                    "subtitle_burned": False,
+                    "subtitle_file": str(tmp_path / "clip-1.srt"),
+                }
+            ]
+
+            run_pipeline(job_id, req, storage_root=str(tmp_path / "storage"))
+
+            mock_render.assert_called_once()
+            call_kwargs = mock_render.call_args.kwargs
+            assert call_kwargs.get("burn_subtitles") is False
+            assert call_kwargs.get("subtitle_path") is None
+
+            job = db.get_job(job_id)
+            assert job is not None
+            assert job.status == "completed"
+            assert any("Subtitle burn-in dinonaktifkan" in entry["msg"] for entry in job.progress_log)
+
+    def test_job_options_persisted_in_db(self):
+        """db.create_job persists options JSON and retrieves it in JobRecord."""
+        from backend.models.db import db
+        job_id = "test-job-options"
+        options = {
+            "burn_subtitles": False,
+            "output_formats": ["9:16"],
+            "llm_provider": "openai",
+            "llm_model": "gpt-4o-mini",
+        }
+        db.create_job(
+            job_id=job_id,
+            youtube_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            selection_mode="manual",
+            options=options,
+        )
+        rec = db.get_job(job_id)
+        assert rec is not None
+        assert rec.options == options
+        assert rec.options.get("burn_subtitles") is False
 

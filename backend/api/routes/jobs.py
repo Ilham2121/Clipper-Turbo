@@ -89,6 +89,12 @@ def create_job(
         job_id=job_id,
         youtube_url=request.youtube_url,
         selection_mode=request.selection_mode,
+        options={
+            "burn_subtitles": request.burn_subtitles,
+            "output_formats": request.output_formats,
+            "llm_provider": request.llm_provider,
+            "llm_model": request.llm_model,
+        },
     )
 
     # AC-12: Non-blocking execution in background
@@ -116,6 +122,7 @@ def _build_status_payload(job_id: str) -> JobStatusResponse:
                 segment_end=c.get("segmentEnd", 0.0),
                 format=c["format"],
                 download_url=c["downloadUrl"],
+                subtitle_url=c.get("subtitleUrl"),
                 virality_score=c.get("viralityScore"),
                 hook=c.get("hook"),
                 caption=c.get("caption"),
@@ -194,6 +201,31 @@ def download_clip(clip_id: str) -> FileResponse:
     )
 
 
+@router.get("/clips/{clip_id}/subtitles")
+def download_clip_subtitles(clip_id: str) -> FileResponse:
+    """Download the sidecar .srt subtitle file for a clip if available."""
+    clip = db.get_clip(clip_id)
+    if not clip:
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    subtitle_path = clip.get("subtitlePath") or clip.get("extra", {}).get("subtitlePath")
+    if not subtitle_path or not os.path.isfile(subtitle_path):
+        file_path = clip.get("filePath")
+        if file_path:
+            candidate = os.path.splitext(file_path)[0] + ".srt"
+            if os.path.isfile(candidate):
+                subtitle_path = candidate
+
+    if not subtitle_path or not os.path.isfile(subtitle_path):
+        raise HTTPException(status_code=404, detail="Subtitle file not found for this clip")
+
+    return FileResponse(
+        path=subtitle_path,
+        media_type="application/x-subrip",
+        filename=os.path.basename(subtitle_path),
+    )
+
+
 @router.get("/jobs/{job_id}/download-all")
 def download_all_clips(job_id: str) -> Response:
     """Download all rendered clips of a job as one .zip (Fase 4 Iterasi 4.3)."""
@@ -215,6 +247,10 @@ def download_all_clips(job_id: str) -> Response:
             entry_name = f"clip-{clip.get('id')}-{fmt}.mp4"
             zf.write(file_path, arcname=entry_name)
             added += 1
+
+            sub_path = clip.get("subtitlePath") or (os.path.splitext(file_path)[0] + ".srt" if file_path else None)
+            if sub_path and os.path.isfile(sub_path):
+                zf.write(sub_path, arcname=f"clip-{clip.get('id')}-{fmt}.srt")
 
     if added == 0:
         raise HTTPException(status_code=404, detail="No clip files found on disk")

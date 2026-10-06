@@ -9,6 +9,7 @@ import os
 import re
 
 from backend.core.errors import TranscriptionError
+from backend.pipeline.text_normalize import normalize_transcript_segments
 
 DEFAULT_ASR_MODEL = "small"
 ASR_MODEL_FALLBACKS = ("small", "base", "tiny")
@@ -63,7 +64,7 @@ def _parse_vtt(path: str) -> list[dict]:
                     raw_segments.append({"start": start, "end": end, "text": text})
                 break
 
-    return _dedupe_rolling_captions(raw_segments)
+    return normalize_transcript_segments(_dedupe_rolling_captions(raw_segments))
 
 
 def _dedupe_rolling_captions(segments: list[dict]) -> list[dict]:
@@ -168,7 +169,13 @@ def _run_asr(video_path: str) -> list[dict]:
                 words = getattr(seg, "words", None)
                 if words:
                     entry["words"] = [
-                        {"start": w.start, "end": w.end, "word": w.word.strip()}
+                        {
+                            "start": w.start,
+                            "end": w.end,
+                            "word": w.word.strip(),
+                            "raw": getattr(w, "word", ""),
+                            "prob": getattr(w, "probability", 1.0),
+                        }
                         for w in words
                         if w.word and w.word.strip()
                     ]
@@ -177,7 +184,9 @@ def _run_asr(video_path: str) -> list[dict]:
             if not segments:
                 raise TranscriptionError("ASR produced empty transcript")
 
-            return _merge_overlapping_segments(_drop_repeated_segments(segments))
+            return normalize_transcript_segments(
+                _merge_overlapping_segments(_drop_repeated_segments(segments))
+            )
 
         except MemoryError as exc:
             last_error = exc

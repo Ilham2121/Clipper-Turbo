@@ -14,6 +14,8 @@ Design rationale (fixes the stacked-text bug):
 
 from dataclasses import dataclass
 
+from backend.pipeline.text_normalize import normalize_word_tokens
+
 DEFAULT_MAX_WORDS = 4
 DEFAULT_FONT_SIZE = 72
 DEFAULT_HIGHLIGHT_COLOR = "&H00D7FF&"  # ASS BGR: amber/yellow
@@ -32,6 +34,7 @@ class SubtitleStyle:
     position: str = DEFAULT_POSITION
     outline: int = 5
     margin_v: int = 180
+    sync_mode: str = "block"
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "SubtitleStyle":
@@ -47,11 +50,13 @@ class SubtitleStyle:
             font_size = DEFAULT_FONT_SIZE
         position = str(data.get("position", DEFAULT_POSITION))
         color = str(data.get("highlight_color", DEFAULT_HIGHLIGHT_COLOR))
+        sync = str(data.get("sync_mode", "block"))
         return cls(
             max_words=max(1, min(8, max_words)),
             font_size=max(24, min(160, font_size)),
             highlight_color=color if color.startswith("&H") else DEFAULT_HIGHLIGHT_COLOR,
             position=position if position in _POSITION_ALIGNMENT else DEFAULT_POSITION,
+            sync_mode=sync if sync in ("block", "word") else "block",
         )
 
     def to_dict(self) -> dict:
@@ -60,6 +65,7 @@ class SubtitleStyle:
             "font_size": self.font_size,
             "highlight_color": self.highlight_color,
             "position": self.position,
+            "sync_mode": self.sync_mode,
         }
 
 
@@ -123,6 +129,7 @@ def _collect_words(
                 end = start + 0.12  # keep a minimal visible duration
             words.append({"word": text, "start": start, "end": end})
 
+    words = normalize_word_tokens(words)
     words.sort(key=lambda w: (w["start"], w["end"]))
 
     # Enforce monotonic, non-overlapping time: a word may never start before
@@ -180,22 +187,46 @@ def build_ass(
         if end <= start:
             end = block[-1]["end"] if block[-1]["end"] > start else start + 0.15
 
-        # Highlight the longest word in the block (closest to the "active" one)
-        # while keeping the whole phrase visible for readability.
-        active = max(range(len(block)), key=lambda i: (block[i]["end"] - block[i]["start"]))
-        parts = []
-        for i, word in enumerate(block):
-            text = _escape_ass_text(word["word"])
-            if i == active:
-                parts.append(
-                    f"{{\\c{style.highlight_color}\\3c&H000000&\\b1}}{text}{{\\r}}"
+        if style.sync_mode == "word":
+            # Emit sequential dialogue events for each word in the block so the active highlight tracks speech in real time
+            for i, active_word in enumerate(block):
+                w_start = max(start, active_word["start"])
+                if i + 1 < len(block):
+                    w_end = min(end, max(w_start + 0.05, block[i + 1]["start"]))
+                else:
+                    w_end = end
+                if w_end <= w_start:
+                    w_end = w_start + 0.1
+
+                parts = []
+                for j, word in enumerate(block):
+                    text = _escape_ass_text(word["word"])
+                    if j == i:
+                        parts.append(
+                            f"{{\\c{style.highlight_color}\\3c&H000000&\\b1}}{text}{{\\r}}"
+                        )
+                    else:
+                        parts.append(text)
+                lines.append(
+                    f"Dialogue: 0,{_ass_timestamp(w_start)},{_ass_timestamp(w_end)},"
+                    f"Phrase,,0,0,0,,{' '.join(parts)}"
                 )
-            else:
-                parts.append(text)
-        lines.append(
-            f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
-            f"Phrase,,0,0,0,,{' '.join(parts)}"
-        )
+        else:
+            # Default block mode: one event per phrase block, highlighting the most active word
+            active = max(range(len(block)), key=lambda i: (block[i]["end"] - block[i]["start"]))
+            parts = []
+            for i, word in enumerate(block):
+                text = _escape_ass_text(word["word"])
+                if i == active:
+                    parts.append(
+                        f"{{\\c{style.highlight_color}\\3c&H000000&\\b1}}{text}{{\\r}}"
+                    )
+                else:
+                    parts.append(text)
+            lines.append(
+                f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
+                f"Phrase,,0,0,0,,{' '.join(parts)}"
+            )
 
     return "\n".join(lines) + "\n"
 

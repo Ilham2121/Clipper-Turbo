@@ -3261,3 +3261,91 @@ class TestPhase1BurnInToggleAndSidecar:
         assert rec.options == options
         assert rec.options.get("burn_subtitles") is False
 
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Subtitle & Token Normalization & Word-Synced Karaoke Tests
+# ---------------------------------------------------------------------------
+
+
+class TestTextNormalizeAndKaraokeSync:
+    """Tests verifying spacing fixes, Indonesian reduplication, and karaoke word sync."""
+
+    def test_clean_text_spacing_reduplication_and_punctuation(self):
+        from backend.pipeline.text_normalize import clean_text_spacing
+        text = "anak - anak bermain , bersama - sama di taman !"
+        assert clean_text_spacing(text) == "anak-anak bermain, bersama-sama di taman!"
+
+    def test_clean_text_spacing_numbers_and_currency(self):
+        from backend.pipeline.text_normalize import clean_text_spacing
+        text = "Biaya Rp . 50 . 000 , diskon 3 , 5 % untuk 10 . 000 orang ."
+        assert clean_text_spacing(text) == "Biaya Rp 50.000, diskon 3,5% untuk 10.000 orang."
+
+    def test_clean_text_spacing_contractions_and_brackets(self):
+        from backend.pipeline.text_normalize import clean_text_spacing
+        text = "I do n't think it 's okay ( benar kan ? )"
+        assert clean_text_spacing(text) == "I don't think it's okay (benar kan?)"
+
+    def test_normalize_word_tokens_merges_hyphen_and_punctuation(self):
+        from backend.pipeline.text_normalize import normalize_word_tokens
+        tokens = [
+            {"word": "anak", "raw": " anak", "start": 0.0, "end": 0.4},
+            {"word": "-", "raw": "-", "start": 0.4, "end": 0.5},
+            {"word": "anak", "raw": "anak", "start": 0.5, "end": 0.9},
+            {"word": ",", "raw": ",", "start": 0.9, "end": 1.0},
+        ]
+        merged = normalize_word_tokens(tokens)
+        assert len(merged) == 1
+        assert merged[0]["word"] == "anak-anak,"
+        assert merged[0]["start"] == 0.0
+        assert merged[0]["end"] == 1.0
+
+    def test_normalize_transcript_segments(self):
+        from backend.pipeline.text_normalize import normalize_transcript_segments
+        raw = [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "Halo , apa kabar ?",
+                "words": [
+                    {"word": "Halo", "raw": " Halo", "start": 0.0, "end": 0.8},
+                    {"word": ",", "raw": ",", "start": 0.8, "end": 0.9},
+                    {"word": "apa", "raw": " apa", "start": 0.9, "end": 1.3},
+                    {"word": "kabar", "raw": " kabar", "start": 1.3, "end": 1.8},
+                    {"word": "?", "raw": "?", "start": 1.8, "end": 1.9},
+                ],
+            }
+        ]
+        norm = normalize_transcript_segments(raw)
+        assert norm[0]["text"] == "Halo, apa kabar?"
+        words = norm[0]["words"]
+        assert [w["word"] for w in words] == ["Halo,", "apa", "kabar?"]
+
+    def test_karaoke_build_ass_sequential_word_highlight(self):
+        """build_ass emits sequential events per active word so highlight tracks speech in real time."""
+        from backend.pipeline.karaoke import SubtitleStyle, build_ass
+        transcript = [
+            {
+                "start": 0.0,
+                "end": 3.0,
+                "text": "Selamat datang kawan",
+                "words": [
+                    {"word": "Selamat", "start": 0.0, "end": 1.0},
+                    {"word": "datang", "start": 1.0, "end": 2.0},
+                    {"word": "kawan", "start": 2.0, "end": 3.0},
+                ],
+            }
+        ]
+        style = SubtitleStyle(max_words=3, highlight_color="&H00D7FF&", sync_mode="word")
+        ass_content = build_ass(transcript, segment_start=0.0, segment_end=3.0, style=style)
+
+        dialogues = [line for line in ass_content.splitlines() if line.startswith("Dialogue:")]
+        # Exactly 3 dialogue lines for the 3 words in the phrase block
+        assert len(dialogues) == 3
+        # First dialogue highlights Selamat
+        assert r"{\c&H00D7FF&\3c&H000000&\b1}Selamat{\r} datang kawan" in dialogues[0]
+        # Second dialogue highlights datang
+        assert r"Selamat {\c&H00D7FF&\3c&H000000&\b1}datang{\r} kawan" in dialogues[1]
+        # Third dialogue highlights kawan
+        assert r"Selamat datang {\c&H00D7FF&\3c&H000000&\b1}kawan{\r}" in dialogues[2]
+
+

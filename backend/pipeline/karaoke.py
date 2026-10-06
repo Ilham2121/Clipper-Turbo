@@ -69,21 +69,27 @@ class SubtitleStyle:
         }
 
 
-def _header(style: SubtitleStyle) -> str:
+def _header(style: SubtitleStyle, aspect_ratio: str = "9:16") -> str:
     alignment = _POSITION_ALIGNMENT[style.position]
+    is_landscape = (aspect_ratio == "16:9")
+    play_res_x = 1920 if is_landscape else 1080
+    play_res_y = 1080 if is_landscape else 1920
+    font_size = int(round(style.font_size * 0.72)) if is_landscape else style.font_size
+    margin_v = int(round(style.margin_v * 0.55)) if is_landscape else style.margin_v
+
     return (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResX: 1080\n"
-        "PlayResY: 1920\n"
-        "WrapStyle: 2\n"
+        f"PlayResX: {play_res_x}\n"
+        f"PlayResY: {play_res_y}\n"
+        "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Phrase,Arial,{style.font_size},&H00FFFFFF,&H000019FF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0.5,0,1,{style.outline},2,{alignment},60,60,{style.margin_v},1\n\n"
+        f"Style: Phrase,Arial,{font_size},&H00FFFFFF,&H000019FF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0.5,0,1,{style.outline},2,{alignment},60,60,{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -143,8 +149,35 @@ def _collect_words(
 
 
 def _chunk_words(words: list[dict], max_words: int) -> list[list[dict]]:
-    """Group words into phrase blocks of at most `max_words`."""
-    return [words[i : i + max_words] for i in range(0, len(words), max_words)]
+    """Group words into natural phrase blocks based on punctuation, pauses, and max length."""
+    if not words:
+        return []
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+
+    for i, w in enumerate(words):
+        current.append(w)
+        text = str(w.get("word", "")).strip()
+
+        # Check conditions to end the current phrase block:
+        hit_max = len(current) >= max_words
+        hit_sentence_end = any(text.endswith(p) for p in (".", "!", "?")) and len(current) >= 2
+        hit_comma_clause = any(text.endswith(p) for p in (",", ";", ":", "—")) and len(current) >= 3
+
+        hit_pause = False
+        if i + 1 < len(words):
+            next_start = float(words[i + 1].get("start", w.get("end", 0.0)))
+            curr_end = float(w.get("end", next_start))
+            if next_start - curr_end >= 0.35 and len(current) >= 2:
+                hit_pause = True
+
+        if hit_max or hit_sentence_end or hit_comma_clause or hit_pause:
+            chunks.append(current)
+            current = []
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def build_ass(
@@ -152,6 +185,7 @@ def build_ass(
     segment_start: float = 0.0,
     segment_end: float | None = None,
     style: SubtitleStyle | None = None,
+    aspect_ratio: str = "9:16",
 ) -> str:
     """Build ASS content with one Dialogue event per phrase block.
 
@@ -163,6 +197,7 @@ def build_ass(
         segment_start: Clip start second (subtracted from all timestamps).
         segment_end: Clip end second; words outside are dropped.
         style: Visual style; defaults to SubtitleStyle().
+        aspect_ratio: "9:16" (portrait) or "16:9" (landscape).
 
     Raises:
         ValueError: When no usable word timings exist.
@@ -176,7 +211,7 @@ def build_ass(
         raise ValueError("No word-level timestamps found; cannot build phrase ASS.")
 
     blocks = _chunk_words(words, style.max_words)
-    lines = [_header(style).rstrip("\n")]
+    lines = [_header(style, aspect_ratio=aspect_ratio).rstrip("\n")]
     for idx, block in enumerate(blocks):
         start = block[0]["start"]
         # Non-overlap guarantee: this block ends where the next one begins.
@@ -237,6 +272,7 @@ def transcript_to_ass_file(
     segment_start: float = 0.0,
     segment_end: float | None = None,
     style: SubtitleStyle | None = None,
+    aspect_ratio: str = "9:16",
 ) -> str:
     """Write phrase-block ASS for a clip. Returns output_path."""
     content = build_ass(
@@ -244,6 +280,7 @@ def transcript_to_ass_file(
         segment_start=segment_start,
         segment_end=segment_end,
         style=style,
+        aspect_ratio=aspect_ratio,
     )
     with open(output_path, "w", encoding="utf-8-sig") as f:
         f.write(content)

@@ -457,22 +457,32 @@ def render_segments(
             except Exception:
                 sidecar_srt_path = None
 
-        # Burn-in subtitle per clip (only when burn_subtitles is True).
-        clip_subtitle_path = None
-        if burn_subtitles:
-            clip_subtitle_path = subtitle_path
-            if transcript:
-                ass_path = os.path.join(output_dir, f"karaoke_{seg_idx + 1}.ass")
-                try:
-                    clip_subtitle_path = transcript_to_ass_file(
-                        transcript, ass_path, segment_start=start, segment_end=end,
-                        style=subtitle_style,
-                    )
-                except ValueError:
-                    clip_subtitle_path = subtitle_path
-
         for fmt in output_formats:
             fmt_slug = fmt.replace(":", "x")
+            # Format-specific burn-in subtitle (1080x1920 for 9:16 vs 1920x1080 for 16:9)
+            clip_subtitle_path = None
+            if burn_subtitles:
+                clip_subtitle_path = subtitle_path
+                if transcript:
+                    ass_path = os.path.join(output_dir, f"karaoke_{seg_idx + 1}_{fmt_slug}.ass")
+                    legacy_ass_path = os.path.join(output_dir, f"karaoke_{seg_idx + 1}.ass")
+                    try:
+                        clip_subtitle_path = transcript_to_ass_file(
+                            transcript,
+                            ass_path,
+                            segment_start=start,
+                            segment_end=end,
+                            style=subtitle_style,
+                            aspect_ratio=fmt,
+                        )
+                        # Maintain backward-compatible filename expected by tests and legacy consumers
+                        try:
+                            shutil.copyfile(ass_path, legacy_ass_path)
+                        except Exception:
+                            pass
+                    except ValueError:
+                        clip_subtitle_path = subtitle_path
+
             planned.append({
                 "seg_idx": seg_idx,
                 "seg": seg,

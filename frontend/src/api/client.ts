@@ -304,6 +304,7 @@ export interface SubtitleStyle {
   font_size: number;
   highlight_color: string;
   position: 'bottom' | 'center' | 'top';
+  sync_mode?: 'block' | 'word';
 }
 
 export async function getSubtitleStyle(): Promise<SubtitleStyle> {
@@ -319,6 +320,50 @@ export async function saveSubtitleStyle(style: Partial<SubtitleStyle>): Promise<
     body: JSON.stringify(style),
   });
   if (!response.ok) throw new Error(await parseError(response, 'Gagal menyimpan gaya subtitle'));
+  return response.json();
+}
+
+export interface AsrSettings {
+  provider: string;
+  model: string;
+  device: string;
+  language: string;
+  glossary: string[];
+  vad_filter: boolean;
+}
+
+export async function getAsrSettings(): Promise<AsrSettings> {
+  const response = await fetch('/api/maintenance/settings/asr');
+  if (!response.ok) throw new Error(await parseError(response, 'Gagal memuat konfigurasi Speech-to-Text'));
+  return response.json();
+}
+
+export async function saveAsrSettings(settings: Partial<AsrSettings>): Promise<AsrSettings> {
+  const response = await fetch('/api/maintenance/settings/asr', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
+  if (!response.ok) throw new Error(await parseError(response, 'Gagal menyimpan konfigurasi Speech-to-Text'));
+  return response.json();
+}
+
+export interface SystemDiagnostics {
+  os: string;
+  python: string;
+  ffmpegInstalled: boolean;
+  ffmpegPath: string;
+  cudaAvailable: boolean;
+  cudaDeviceCount: number;
+  defaultDevice: string;
+  activeJobs: number;
+  maxConcurrent: number;
+  dbPath: string;
+}
+
+export async function getSystemDiagnostics(): Promise<SystemDiagnostics> {
+  const response = await fetch('/api/maintenance/diagnostics/system');
+  if (!response.ok) throw new Error(await parseError(response, 'Gagal memuat data diagnostik'));
   return response.json();
 }
 

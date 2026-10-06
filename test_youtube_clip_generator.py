@@ -2357,6 +2357,54 @@ class TestStorageMaintenance:
         )
         assert traversal.status_code in (404, 422)
 
+    def test_subtitle_style_sync_mode_api(self, api_client):
+        """PUT /api/maintenance/settings/subtitle menyimpan sync_mode='word' dan terbaca kembali."""
+        resp = api_client.put(
+            "/api/maintenance/settings/subtitle",
+            json={"sync_mode": "word", "max_words": 3},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("sync_mode") == "word"
+        assert data.get("max_words") == 3
+
+        get_resp = api_client.get("/api/maintenance/settings/subtitle")
+        assert get_resp.status_code == 200
+        assert get_resp.json().get("sync_mode") == "word"
+
+    def test_asr_settings_api(self, api_client):
+        """GET & PUT /api/maintenance/settings/asr menyimpan preferensi ASR dan glossary."""
+        put_resp = api_client.put(
+            "/api/maintenance/settings/asr",
+            json={
+                "provider": "local",
+                "model": "large-v3-turbo",
+                "device": "auto",
+                "glossary": "Prabowo, Gibran, podcast",
+                "vad_filter": True,
+            },
+        )
+        assert put_resp.status_code == 200
+
+        get_resp = api_client.get("/api/maintenance/settings/asr")
+        assert get_resp.status_code == 200
+        saved = get_resp.json()
+        assert saved["provider"] == "local"
+        assert saved["model"] == "large-v3-turbo"
+        assert "Prabowo" in saved["glossary"]
+        assert saved["vad_filter"] is True
+
+    def test_system_diagnostics_api(self, api_client):
+        """GET /api/maintenance/diagnostics/system mengembalikan informasi hardware & environment."""
+        resp = api_client.get("/api/maintenance/diagnostics/system")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "os" in data
+        assert "python" in data
+        assert "ffmpegInstalled" in data
+        assert "cudaAvailable" in data
+        assert "dbPath" in data
+
     def test_cleanup_interval_env_parsing(self, monkeypatch):
         """CLIPPER_CLEANUP_INTERVAL_MINUTES: nilai valid dipakai, invalid -> default."""
         from backend.main import _cleanup_interval_minutes

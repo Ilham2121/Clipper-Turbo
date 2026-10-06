@@ -4,7 +4,7 @@ import { createJob, getJobStatus, subscribeJobEvents } from './api/client';
 import { JobForm } from './components/JobForm';
 import { JobProgress } from './components/JobProgress';
 import { ClipResults } from './components/ClipResults';
-import { SettingsDrawer } from './components/SettingsDrawer';
+import { SettingsModal } from './components/SettingsModal';
 import type { HistoryEntry } from './history';
 import { clearHistory, loadHistory, removeEntry, upsertEntry } from './history';
 import { clearActiveJob, loadActiveJob, saveActiveJob } from './activeJob';
@@ -287,7 +287,7 @@ export const App: React.FC = () => {
           <ClipResults clips={jobStatus.clips} onReset={handleClearView} jobId={jobStatus.jobId} />
         )}
       </main>
-      <SettingsDrawer
+      <SettingsModal
         open={settingsOpen}
         entries={history}
         onSelectHistory={handleSelectHistory}

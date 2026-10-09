@@ -106,6 +106,7 @@ export interface CreateJobFormData {
   selectionMode: 'auto' | 'manual';
   outputFormats: AspectRatio[];
   burnSubtitles?: boolean;
+  reframeMode?: 'auto' | 'speaker_focus' | 'split_stack' | 'center_crop';
   manualSegments?: ManualSegment[];
   llmProvider?: string;
   llmApiKey?: string;
@@ -168,6 +169,10 @@ export function buildJobPayload(formData: CreateJobFormData): Record<string, unk
     outputFormats: formData.outputFormats,
     burnSubtitles: formData.burnSubtitles ?? true,
   };
+
+  if (formData.reframeMode) {
+    base.reframeMode = formData.reframeMode;
+  }
 
   if (formData.selectionMode === 'manual') {
     base.manualSegments = formData.manualSegments || [];

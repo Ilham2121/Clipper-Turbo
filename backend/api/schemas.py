@@ -41,6 +41,7 @@ class CreateJobRequest(BaseModel):
     llm_base_url: str | None = Field(None, alias="llmBaseUrl")
     output_formats: list[Literal["9:16", "16:9"]] = Field(..., alias="outputFormats")
     burn_subtitles: bool = Field(True, alias="burnSubtitles")
+    reframe_mode: str | None = Field("auto", alias="reframeMode")
 
     @field_validator("youtube_url")
     @classmethod

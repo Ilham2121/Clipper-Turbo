@@ -1,35 +1,26 @@
 import React, { useState, useEffect, useRef } from 'react';
+import {
+  Settings,
+  Sparkles,
+  Zap,
+  Smartphone,
+  FileText,
+  Activity,
+  Wifi,
+  WifiOff,
+} from 'lucide-react';
 import type { CreateJobFormData, JobStatusResponse } from './api/client';
 import { createJob, getJobStatus, subscribeJobEvents } from './api/client';
 import { JobForm } from './components/JobForm';
 import { JobProgress } from './components/JobProgress';
 import { ClipResults } from './components/ClipResults';
 import { SettingsModal } from './components/SettingsModal';
+import { ToastProvider } from './components/Toast';
 import type { HistoryEntry } from './history';
 import { clearHistory, loadHistory, removeEntry, upsertEntry } from './history';
 import { clearActiveJob, loadActiveJob, saveActiveJob } from './activeJob';
 
-const GearIcon: React.FC = () => (
-  <svg
-    width="16"
-    height="16"
-    viewBox="0 0 24 24"
-    fill="none"
-    stroke="currentColor"
-    strokeWidth="2"
-    strokeLinecap="round"
-    strokeLinejoin="round"
-    aria-hidden="true"
-  >
-    <circle cx="12" cy="12" r="3" />
-    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.35.41.65.75.85H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-  </svg>
-);
-
-export const App: React.FC = () => {
-  // Only a *running* job is worth restoring; finished ones already live in the
-  // history drawer. Restoring a completed job is what made the panel/results
-  // reappear after every refresh with no way to clear them.
+export const AppContent: React.FC = () => {
   const restoredJob = loadActiveJob();
   const [currentJobId, setCurrentJobId] = useState<string | null>(restoredJob?.jobId ?? null);
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(
@@ -45,17 +36,23 @@ export const App: React.FC = () => {
   const lastJobUrlRef = useRef<string>('');
   const progressAnchorRef = useRef<HTMLDivElement>(null);
 
-  // Cek koneksi backend saat inisialisasi
-  useEffect(() => {
+  // Health check polling backend status
+  const checkHealth = () => {
     fetch('/api/health')
       .then((res) => {
         if (res.ok) setServerOnline(true);
         else setServerOnline(false);
       })
       .catch(() => setServerOnline(false));
+  };
+
+  useEffect(() => {
+    checkHealth();
+    const interval = window.setInterval(checkHealth, 20000);
+    return () => window.clearInterval(interval);
   }, []);
 
-  // Polling status job (AC-9, AC-12)
+  // Poll job status (AC-9, AC-12)
   useEffect(() => {
     if (!currentJobId) return;
 
@@ -67,17 +64,14 @@ export const App: React.FC = () => {
         if (!isSubscribed) return;
         setJobStatus(res);
 
-        // Berhenti polling jika job sudah selesai atau gagal
         if (res.status === 'completed' || res.status === 'failed') {
           return;
         }
 
-        // Jadwalkan polling berikutnya dalam 2 detik
         pollTimerRef.current = window.setTimeout(poll, 2000);
       } catch (err) {
         console.error('Error polling job status:', err);
         if (isSubscribed) {
-          // Tetap coba polling lagi setelah 3 detik jika terjadi kendala jaringan sementara
           pollTimerRef.current = window.setTimeout(poll, 3000);
         }
       }
@@ -93,7 +87,7 @@ export const App: React.FC = () => {
     };
   }, [currentJobId]);
 
-  // SSE realtime updates (Iterasi 2.2); polling above stays as fallback path
+  // SSE realtime updates
   useEffect(() => {
     if (!currentJobId) return;
     return subscribeJobEvents(currentJobId, (res) => setJobStatus(res));
@@ -115,17 +109,12 @@ export const App: React.FC = () => {
     }
   }, [jobStatus]);
 
-  // Finished jobs must not be restored on the next refresh: their snapshot is
-  // already in the history drawer, so the main page starts clean.
   useEffect(() => {
     if (jobStatus?.status === 'completed' || jobStatus?.status === 'failed') {
       clearActiveJob();
     }
   }, [jobStatus?.status]);
 
-  // A restored job may already have finished server-side (e.g. the tab was
-  // closed mid-render). Re-check once on mount so a refresh afterwards starts
-  // clean while genuinely running jobs still resume.
   useEffect(() => {
     if (!restoredJob) return;
     let cancelled = false;
@@ -147,8 +136,6 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-    // Mount-only: re-checking on every render would fight the polling loop.
-    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const scrollToProgress = () => {
@@ -164,14 +151,12 @@ export const App: React.FC = () => {
     try {
       const fresh = await getJobStatus(entry.jobId);
       setJobStatus(fresh);
-      // Only a still-running job is worth restoring after refresh.
       if (fresh.status === 'completed' || fresh.status === 'failed') {
         clearActiveJob();
       } else {
         saveActiveJob({ jobId: entry.jobId, youtubeUrl: entry.youtubeUrl || '' });
       }
     } catch {
-      // History entries are finished jobs by definition -> nothing to restore.
       clearActiveJob();
       setJobStatus({
         jobId: entry.jobId,
@@ -213,7 +198,6 @@ export const App: React.FC = () => {
     setCurrentJobUrl('');
   };
 
-  /** Clear the on-page progress panel + results (history drawer is untouched). */
   const handleClearView = handleReset;
 
   const isJobCompleted = !!(jobStatus && jobStatus.status === 'completed' && jobStatus.clips && jobStatus.clips.length > 0);
@@ -221,72 +205,128 @@ export const App: React.FC = () => {
 
   return (
     <div className="app-container">
-      {/* Header */}
+      {/* Top Header */}
       <header className="header">
         <div className="brand">
-          <div className="brand-icon">CT</div>
+          <div className="brand-icon">
+            <Sparkles size={20} />
+          </div>
           <div>
             <h1 className="brand-title">Clipper Turbo</h1>
-            <p className="brand-subtitle">Automated YouTube Clip Generator</p>
+            <p className="brand-subtitle">Automated YouTube Studio & AI Reframe</p>
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-        <button
-          type="button"
-          className="btn-secondary icon-btn"
-          onClick={() => setSettingsOpen(true)}
-          aria-label="Pengaturan"
-          title="Pengaturan: Riwayat, Storage, API Key"
-        >
-          <GearIcon />
-          {history.length > 0 && <span className="icon-btn-badge">{history.length}</span>}
-        </button>
-        <div className="server-status" title={serverOnline ? 'Backend connected' : 'Backend offline or waiting'}>
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+          <button
+            type="button"
+            className="btn-secondary icon-btn"
+            onClick={() => setSettingsOpen(true)}
+            aria-label="Pengaturan Studio"
+            title="Pengaturan: Riwayat, Storage, Subtitle, ASR, Diagnostik"
+          >
+            <Settings size={18} />
+            {history.length > 0 && <span className="icon-btn-badge">{history.length}</span>}
+          </button>
+
           <div
-            className="status-dot"
-            style={{
-              backgroundColor:
-                serverOnline === true
-                  ? 'var(--status-success)'
-                  : serverOnline === false
-                  ? 'var(--status-error)'
-                  : 'var(--status-warning)',
-            }}
-          />
-          <span>
-            {serverOnline === true
-              ? 'API Aktif'
-              : serverOnline === false
-              ? 'API Terputus'
-              : 'Memeriksa API...'}
-          </span>
-        </div>
+            className="server-status"
+            onClick={checkHealth}
+            style={{ cursor: 'pointer' }}
+            title={serverOnline ? 'Backend API Terhubung (Klik untuk ping)' : 'Backend Terputus / Sedang Menghubungkan'}
+          >
+            <div
+              className="status-dot"
+              style={{
+                backgroundColor:
+                  serverOnline === true
+                    ? 'var(--status-success)'
+                    : serverOnline === false
+                    ? 'var(--status-error)'
+                    : 'var(--status-warning)',
+              }}
+            />
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+              {serverOnline === true ? (
+                <>
+                  <Wifi size={13} color="var(--status-success)" /> API Online
+                </>
+              ) : serverOnline === false ? (
+                <>
+                  <WifiOff size={13} color="var(--status-error)" /> Offline
+                </>
+              ) : (
+                <>
+                  <Activity size={13} color="var(--status-warning)" /> Memeriksa...
+                </>
+              )}
+            </span>
+          </div>
         </div>
       </header>
 
-      {/* Main Content Sections — single page: form on top, process panel below */}
-      <main>
-        {/* Form View: always visible so users never lose the entry point */}
-        <JobForm onSubmit={handleStartJob} isSubmitting={isSubmitting} disabled={isJobRunning} />
+      {/* Main Workspace — Two-Pane Layout on Desktop (Phase 5 / Note 5) */}
+      <main className="workspace-grid">
+        {/* Left Column: Job Composer (Sticky) */}
+        <aside className="workspace-sidebar">
+          <JobForm
+            onSubmit={handleStartJob}
+            isSubmitting={isSubmitting}
+            disabled={isJobRunning}
+            onOpenSettings={() => setSettingsOpen(true)}
+          />
+        </aside>
 
-        {/* Progress panel + terminal log, rendered below the submit button */}
-        <div ref={progressAnchorRef} className="progress-panel-anchor">
+        {/* Right Column: Live Stepper, Progress Log & Results Gallery */}
+        <section className="workspace-content">
+          {/* Active Job Progress */}
           {currentJobId && jobStatus && (
-            <JobProgress
-              key={jobStatus.jobId}
-              status={jobStatus}
-              onReset={handleClearView}
-              youtubeUrl={currentJobUrl || undefined}
-            />
+            <div ref={progressAnchorRef} className="progress-panel-anchor">
+              <JobProgress
+                key={jobStatus.jobId}
+                status={jobStatus}
+                onReset={handleClearView}
+                youtubeUrl={currentJobUrl || undefined}
+              />
+            </div>
           )}
-        </div>
 
-        {/* Results View: stays on the same page, below the progress panel */}
-        {isJobCompleted && jobStatus?.clips && (
-          <ClipResults clips={jobStatus.clips} onReset={handleClearView} jobId={jobStatus.jobId} />
-        )}
+          {/* Results Gallery */}
+          {isJobCompleted && jobStatus?.clips && (
+            <ClipResults clips={jobStatus.clips} onReset={handleClearView} jobId={jobStatus.jobId} />
+          )}
+
+          {/* Studio Empty State when idle */}
+          {!currentJobId && (
+            <div className="studio-empty-state">
+              <div className="studio-empty-icon">
+                <Sparkles size={28} />
+              </div>
+              <h3 className="studio-empty-title">Studio Siap Digunakan</h3>
+              <p className="studio-empty-desc">
+                Masukkan URL video YouTube di sebelah kiri. Sistem akan mengunduh video, menganalisis transkrip
+                dengan AI, melakukan reframing wajah dinamis, dan membakar subtitle animasi per-kata.
+              </p>
+              <div className="studio-features-list">
+                <span className="studio-feature-chip">
+                  <Zap size={12} color="var(--accent-primary)" /> Akselerasi HW (NVENC/QSV)
+                </span>
+                <span className="studio-feature-chip">
+                  <Smartphone size={12} color="var(--accent-secondary)" /> Dynamic 9:16 Reframing
+                </span>
+                <span className="studio-feature-chip">
+                  <FileText size={12} color="#10b981" /> Word-Synced Karaoke Subtitles
+                </span>
+                <span className="studio-feature-chip">
+                  <Sparkles size={12} color="#f59e0b" /> Virality Scoring AI
+                </span>
+              </div>
+            </div>
+          )}
+        </section>
       </main>
+
+      {/* Floating Centered Settings Modal (Note 3 / Phase 4.2) */}
       <SettingsModal
         open={settingsOpen}
         entries={history}
@@ -296,6 +336,14 @@ export const App: React.FC = () => {
         onClose={() => setSettingsOpen(false)}
       />
     </div>
+  );
+};
+
+export const App: React.FC = () => {
+  return (
+    <ToastProvider>
+      <AppContent />
+    </ToastProvider>
   );
 };
 

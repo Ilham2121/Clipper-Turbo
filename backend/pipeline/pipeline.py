@@ -275,6 +275,7 @@ def run_pipeline(
                 subtitle_style=SubtitleStyle.from_dict(
                     db.get_setting(SUBTITLE_SETTINGS_KEY)
                 ),
+                reframe_mode=getattr(request, "reframe_mode", "auto") or "auto",
                 burn_subtitles=burn_subtitles,
             )
 

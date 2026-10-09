@@ -1,23 +1,58 @@
-import React, { useState } from 'react';
-import type { AspectRatio, CreateJobFormData, ManualSegment } from '../api/client';
-import { LLM_PRESETS } from '../api/client';
+import React, { useState, useEffect } from 'react';
+import {
+  Smartphone,
+  Monitor,
+  Sparkles,
+  Clock,
+  Settings2,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Zap,
+  Film,
+  AlertCircle,
+} from 'lucide-react';
+import type { AspectRatio, CreateJobFormData, ManualSegment, EstimateResponse } from '../api/client';
+import { LLM_PRESETS, getEstimate, formatEstimateRange } from '../api/client';
 import { LlmKeyManager } from './LlmKeyManager';
 import { ManualTimeline } from './ManualTimeline';
+import type { ManualInputRow } from './manualSegments';
+import { parseTimeToSeconds } from './manualSegments';
 
 interface JobFormProps {
   onSubmit: (payload: CreateJobFormData) => Promise<void>;
   isSubmitting: boolean;
   /** True while another job is still running (submit blocked, form stays visible). */
   disabled?: boolean;
+  onOpenSettings?: () => void;
 }
 
-import type { ManualInputRow } from './manualSegments';
-import { parseTimeToSeconds } from './manualSegments';
+function extractYouTubeId(url: string): string | null {
+  if (!url) return null;
+  const match = url.match(
+    /(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|shorts\/|watch\?v=|watch\?.+&v=))([\w-]{11})/,
+  );
+  return match ? match[1] : null;
+}
 
-export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabled }) => {
+function formatDurationSeconds(seconds?: number): string {
+  if (!seconds || seconds <= 0) return '00:00';
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  const mm = m.toString().padStart(2, '0');
+  const ss = s.toString().padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabled, onOpenSettings }) => {
   const [url, setUrl] = useState('');
   const [mode, setMode] = useState<'auto' | 'manual'>('auto');
-  
+
+  // Video preview & estimation
+  const [detectedVideoId, setDetectedVideoId] = useState<string | null>(null);
+  const [estimate, setEstimate] = useState<EstimateResponse | null>(null);
+  const [isEstimating, setIsEstimating] = useState<boolean>(false);
+
   // LLM Config
   const [provider, setProvider] = useState<string>('openrouter');
   const [model, setModel] = useState(LLM_PRESETS.openrouter.defaultModel);
@@ -34,7 +69,46 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
   const [ratio169, setRatio169] = useState(false);
   const [burnSubtitles, setBurnSubtitles] = useState(true);
 
+  // Advanced Options
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [reframeMode, setReframeMode] = useState<'auto' | 'speaker_focus' | 'split_stack' | 'center_crop'>('auto');
+
   const [formError, setFormError] = useState<string | null>(null);
+
+  // Live YouTube video detection & estimate probe
+  useEffect(() => {
+    const vid = extractYouTubeId(url.trim());
+    setDetectedVideoId(vid);
+
+    if (!vid) {
+      setEstimate(null);
+      setIsEstimating(false);
+      return;
+    }
+
+    let isCurrent = true;
+    setIsEstimating(true);
+
+    const timer = window.setTimeout(() => {
+      getEstimate(url.trim())
+        .then((res) => {
+          if (isCurrent) {
+            setEstimate(res);
+            setIsEstimating(false);
+          }
+        })
+        .catch(() => {
+          if (isCurrent) {
+            setIsEstimating(false);
+          }
+        });
+    }, 450);
+
+    return () => {
+      isCurrent = false;
+      window.clearTimeout(timer);
+    };
+  }, [url]);
 
   const handleProviderChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const nextProvider = e.target.value;
@@ -72,11 +146,10 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
     setFormError(null);
 
     if (disabled) {
-      setFormError('Masih ada job berjalan. Tunggu selesai atau hentikan job tersebut dulu.');
+      setFormError('Masih ada job berjalan. Tunggu selesai atau bersihkan job aktif terlebih dahulu.');
       return;
     }
 
-    // Validasi URL
     const trimmedUrl = url.trim();
     if (!trimmedUrl) {
       setFormError('Masukkan URL video YouTube terlebih dahulu.');
@@ -87,7 +160,6 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
       return;
     }
 
-    // Validasi Aspect Ratios
     const aspectRatios: AspectRatio[] = [];
     if (ratio916) aspectRatios.push('9:16');
     if (ratio169) aspectRatios.push('16:9');
@@ -101,11 +173,12 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
       selectionMode: mode,
       outputFormats: aspectRatios,
       burnSubtitles: burnSubtitles,
+      reframeMode: reframeMode,
     };
 
     if (mode === 'auto') {
       if (!hasStoredKey) {
-        setFormError('Simpan API Key untuk provider ini terlebih dahulu (atau isi lalu klik Simpan).');
+        setFormError('Simpan API Key untuk provider ini terlebih dahulu.');
         return;
       }
       formData.llmProvider = provider;
@@ -114,7 +187,6 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
         formData.llmBaseUrl = customEndpoint.trim();
       }
     } else {
-      // Parse manual segments
       const parsedSegments: ManualSegment[] = [];
       for (const row of manualRows) {
         const startSec = parseTimeToSeconds(row.start);
@@ -137,7 +209,6 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
 
     try {
       await onSubmit(formData);
-
     } catch (err: unknown) {
       if (err instanceof Error) {
         setFormError(err.message);
@@ -152,20 +223,27 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
 
   return (
     <form className="card" onSubmit={handleSubmit}>
-      <h2 className="card-title">Konfigurasi Pembuatan Klip</h2>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+        <h2 className="card-title" style={{ margin: 0 }}>Studio Composer</h2>
+        <span className="badge-pill badge-pill-eta">
+          <Sparkles size={12} /> AI Powered
+        </span>
+      </div>
       <p className="card-description">
-        Masukkan URL video YouTube dan tentukan metode penentuan segmen klip.
+        Generate klip vertikal dan horizontal otomatis dengan transkripsi presisi dan reframing cerdas.
       </p>
 
       {formError && (
         <div className="banner banner-error">
+          <AlertCircle size={16} />
           <span>{formError}</span>
         </div>
       )}
 
       {disabled && (
         <div className="banner banner-info">
-          <span>Ada job yang sedang berjalan — lihat panel proses di bawah halaman ini.</span>
+          <Clock size={16} />
+          <span>Job sedang diproses — pantau progres pada panel di sebelah kanan.</span>
         </div>
       )}
 
@@ -174,22 +252,56 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
         <label className="form-label" htmlFor="yt-url">
           URL Video YouTube
         </label>
-        <input
-          id="yt-url"
-          type="url"
-          className="input-text"
-          placeholder="https://www.youtube.com/watch?v=..."
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          required
-          disabled={busy}
-        />
-        <p className="form-helper">Mendukung link reguler maupun youtu.be shortlinks.</p>
+        <div style={{ position: 'relative' }}>
+          <input
+            id="yt-url"
+            type="url"
+            className="input-text"
+            placeholder="https://www.youtube.com/watch?v=... atau https://youtu.be/..."
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            required
+            disabled={busy}
+          />
+        </div>
+
+        {/* Live Video Preview Card */}
+        {detectedVideoId && (
+          <div className="video-preview-card">
+            <div className="video-preview-thumb-wrap">
+              <img
+                src={`https://img.youtube.com/vi/${detectedVideoId}/mqdefault.jpg`}
+                alt="Thumbnail"
+                className="video-preview-thumb"
+              />
+              <span className="video-preview-duration">
+                {formatDurationSeconds(estimate?.duration)}
+              </span>
+            </div>
+            <div className="video-preview-info">
+              <span className="video-preview-title">
+                {isEstimating ? 'Mendeteksi video...' : estimate?.title || 'Video YouTube Terdeteksi'}
+              </span>
+              <div className="video-preview-badges">
+                {estimate && (
+                  <span className="badge-pill badge-pill-eta" title="Perkiraan waktu penyelesaian">
+                    <Clock size={11} /> {formatEstimateRange(estimate.estimatedSeconds, estimate.etaLowSeconds, estimate.etaHighSeconds)}
+                  </span>
+                )}
+                {estimate?.hardwareAccelerated !== undefined && (
+                  <span className="badge-pill badge-pill-hw" title="Akselerasi hardware video encoder">
+                    <Zap size={11} /> {estimate.hardwareAccelerated ? 'GPU Accelerated' : 'CPU Encoding'}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Mode Toggle (AC-11) */}
+      {/* Mode Selection */}
       <div className="form-group">
-        <label className="form-label">Mode Pemilihan Segmen</label>
+        <label className="form-label">Mode Kurasi Klip</label>
         <div className="segmented-control">
           <button
             type="button"
@@ -197,6 +309,7 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
             onClick={() => setMode('auto')}
             disabled={busy}
           >
+            <Sparkles size={14} style={{ display: 'inline', verticalAlign: 'text-bottom', marginRight: '5px' }} />
             Otomatis (AI LLM)
           </button>
           <button
@@ -205,17 +318,26 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
             onClick={() => setMode('manual')}
             disabled={busy}
           >
+            <Clock size={14} style={{ display: 'inline', verticalAlign: 'text-bottom', marginRight: '5px' }} />
             Manual (Timestamp)
           </button>
         </div>
       </div>
 
-      {/* Section Mode Otomatis */}
+      {/* Auto Mode Config */}
       {mode === 'auto' && (
-        <div className="form-group" style={{ padding: '1rem', background: 'var(--bg-input)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
+        <div
+          className="form-group"
+          style={{
+            padding: '1rem',
+            background: 'var(--bg-input)',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border-subtle)',
+          }}
+        >
           <div className="form-group">
             <label className="form-label" htmlFor="llm-provider">
-              Pilihan Provider LLM
+              Pilihan Model AI
             </label>
             <select
               id="llm-provider"
@@ -224,75 +346,53 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
               onChange={handleProviderChange}
               disabled={busy}
             >
-              {Object.entries(LLM_PRESETS).map(([key, info]) => (
-                <option key={key} value={key}>
-                  {info.label}
+              {Object.entries(LLM_PRESETS).map(([k, v]) => (
+                <option key={k} value={k}>
+                  {v.label}
                 </option>
               ))}
             </select>
-          </div>
-
-          {currentPreset && (
-            <div className="banner banner-info" style={{ marginBottom: '1rem' }}>
-              <span>{currentPreset.tip}</span>
-            </div>
-          )}
-
-          <div className="form-group">
-            <label className="form-label" htmlFor="llm-model">
-              Nama Model
-            </label>
-            <input
-              id="llm-model"
-              type="text"
-              className="input-text input-mono"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              placeholder="e.g. meta-llama/llama-3.3-70b-instruct:free"
-              disabled={busy}
-            />
+            {currentPreset && <p className="form-helper">{currentPreset.tip}</p>}
           </div>
 
           <LlmKeyManager
-            key={provider}
             provider={provider}
             model={model}
             customEndpoint={customEndpoint}
-            disabled={busy}
             onHasKeyChange={setHasStoredKey}
+            disabled={busy}
           />
-
-          {provider === 'custom' && (
-            <div className="form-group">
-              <label className="form-label" htmlFor="custom-endpoint">
-                Custom Endpoint URL
-              </label>
-              <input
-                id="custom-endpoint"
-                type="url"
-                className="input-text input-mono"
-                value={customEndpoint}
-                onChange={(e) => setCustomEndpoint(e.target.value)}
-                placeholder="http://localhost:11434/v1"
-                disabled={busy}
-              />
-            </div>
-          )}
         </div>
       )}
 
-      {/* Section Mode Manual */}
+      {/* Manual Mode Config */}
       {mode === 'manual' && (
-        <div className="form-group" style={{ padding: '1rem', background: 'var(--bg-input)', borderRadius: 'var(--radius-md)', border: '1px solid var(--border-subtle)' }}>
-          <label className="form-label">Daftar Rentang Waktu Klip</label>
-          <p className="form-helper" style={{ marginBottom: '0.75rem' }}>
-            Format waktu bisa berupa detik (misal: <code>45</code>) atau format menit:detik (misal: <code>01:15</code>).
-          </p>
-
-          <ManualTimeline url={url} rows={manualRows} onUpdateRow={handleUpdateSegmentRow} />
+        <div
+          className="form-group"
+          style={{
+            padding: '1rem',
+            background: 'var(--bg-input)',
+            borderRadius: 'var(--radius-md)',
+            border: '1px solid var(--border-subtle)',
+          }}
+        >
+          <label className="form-label">Tentukan Segmen Timestamp (MM:SS)</label>
+          <ManualTimeline
+            url={url}
+            rows={manualRows}
+            onUpdateRow={handleUpdateSegmentRow}
+          />
 
           {manualRows.map((row) => (
-            <div key={row.id} className="segment-row">
+            <div
+              key={row.id}
+              style={{
+                display: 'flex',
+                gap: '0.5rem',
+                alignItems: 'center',
+                marginTop: '0.5rem',
+              }}
+            >
               <input
                 type="text"
                 className="input-text input-mono"
@@ -300,7 +400,7 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
                 value={row.start}
                 onChange={(e) => handleUpdateSegmentRow(row.id, 'start', e.target.value)}
                 disabled={busy}
-                style={{ maxWidth: '140px' }}
+                style={{ maxWidth: '130px' }}
                 required
               />
               <span style={{ color: 'var(--text-muted)' }}>—</span>
@@ -311,13 +411,13 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
                 value={row.end}
                 onChange={(e) => handleUpdateSegmentRow(row.id, 'end', e.target.value)}
                 disabled={busy}
-                style={{ maxWidth: '140px' }}
+                style={{ maxWidth: '130px' }}
                 required
               />
               <input
                 type="text"
                 className="input-text"
-                placeholder="Label / Judul Klip"
+                placeholder="Label momen"
                 value={row.label}
                 onChange={(e) => handleUpdateSegmentRow(row.id, 'label', e.target.value)}
                 disabled={busy}
@@ -328,9 +428,8 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
                   className="btn-secondary btn-danger"
                   onClick={() => handleRemoveSegmentRow(row.id)}
                   disabled={busy}
-                  title="Hapus baris segmen"
                 >
-                  Hapus
+                  ✕
                 </button>
               )}
             </div>
@@ -341,77 +440,170 @@ export const JobForm: React.FC<JobFormProps> = ({ onSubmit, isSubmitting, disabl
             className="btn-secondary"
             onClick={handleAddSegmentRow}
             disabled={busy}
-            style={{ marginTop: '0.5rem' }}
+            style={{ marginTop: '0.75rem', fontSize: '0.825rem' }}
           >
-            + Tambah Segmen Klip
+            + Tambah Baris Segmen
           </button>
         </div>
       )}
 
-      {/* Aspect Ratio & Options */}
+      {/* Aspect Ratio Cards */}
       <div className="form-group">
-        <label className="form-label">Format Output & Rasio</label>
-        <div className="options-grid">
-          <label className={`option-checkbox-card ${ratio916 ? 'selected' : ''}`}>
-            <input
-              type="checkbox"
-              checked={ratio916}
-              onChange={(e) => setRatio916(e.target.checked)}
-              disabled={busy}
-            />
-            <div>
-              <strong>9:16 Vertikal</strong>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                Shorts, Reels, TikTok (Smart Reframe)
+        <label className="form-label">Rasio Format Klip</label>
+        <div className="aspect-selector-grid">
+          <div
+            className={`aspect-tile ${ratio916 ? 'selected' : ''}`}
+            onClick={() => !busy && setRatio916(!ratio916)}
+            role="checkbox"
+            aria-checked={ratio916}
+            tabIndex={0}
+          >
+            <div className="aspect-tile-header">
+              <div className="aspect-tile-icon-wrap">
+                <Smartphone size={18} color="var(--accent-primary)" />
+                <span>9:16 Vertikal</span>
               </div>
+              <input
+                type="checkbox"
+                checked={ratio916}
+                onChange={() => {}}
+                style={{ accentColor: 'var(--accent-primary)' }}
+                disabled={busy}
+              />
             </div>
-          </label>
+            <p className="aspect-tile-desc">
+              Untuk TikTok, YouTube Shorts, Reels dengan auto-tracking wajah.
+            </p>
+          </div>
 
-          <label className={`option-checkbox-card ${ratio169 ? 'selected' : ''}`}>
-            <input
-              type="checkbox"
-              checked={ratio169}
-              onChange={(e) => setRatio169(e.target.checked)}
-              disabled={busy}
-            />
-            <div>
-              <strong>16:9 Horizontal</strong>
-              <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-                YouTube Standar / Landscape
+          <div
+            className={`aspect-tile ${ratio169 ? 'selected' : ''}`}
+            onClick={() => !busy && setRatio169(!ratio169)}
+            role="checkbox"
+            aria-checked={ratio169}
+            tabIndex={0}
+          >
+            <div className="aspect-tile-header">
+              <div className="aspect-tile-icon-wrap">
+                <Monitor size={18} color="var(--accent-secondary)" />
+                <span>16:9 Horizontal</span>
               </div>
+              <input
+                type="checkbox"
+                checked={ratio169}
+                onChange={() => {}}
+                style={{ accentColor: 'var(--accent-secondary)' }}
+                disabled={busy}
+              />
             </div>
-          </label>
+            <p className="aspect-tile-desc">
+              Format standar landscape untuk feed YouTube desktop & video reguler.
+            </p>
+          </div>
         </div>
       </div>
 
-      {/* Burn Subtitles Toggle */}
+      {/* Burn-in Subtitles Switch */}
       <div className="form-group">
-        <label className={`option-checkbox-card ${burnSubtitles ? 'selected' : ''}`}>
-          <input
-            type="checkbox"
-            checked={burnSubtitles}
-            onChange={(e) => setBurnSubtitles(e.target.checked)}
-            disabled={busy}
-          />
-          <div>
-            <strong>Burn-in Subtitles ke Video</strong>
-            <div style={{ fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              Menempelkan subtitle otomatis langsung di dalam frame video klip.
+        <div
+          className="switch-control-card"
+          onClick={() => !busy && setBurnSubtitles(!burnSubtitles)}
+          role="switch"
+          aria-checked={burnSubtitles}
+          tabIndex={0}
+        >
+          <div className="switch-label-wrap">
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              <Sparkles size={16} color="var(--accent-primary)" />
+              <span className="switch-title">Burn-in Subtitle & Karaoke</span>
             </div>
+            <span className="switch-desc">
+              {burnSubtitles
+                ? 'Subtitle di-render langsung ke video dengan highlight per-kata.'
+                : 'Tanpa subtitle video (hanya export sidecar .srt gratis).'}
+            </span>
           </div>
-        </label>
+
+          <div className={`switch-track ${burnSubtitles ? 'active' : ''}`}>
+            <div className="switch-thumb" />
+          </div>
+        </div>
+      </div>
+
+      {/* Advanced Options Accordion */}
+      <div className="disclosure-card">
+        <button
+          type="button"
+          className="disclosure-trigger"
+          onClick={() => setAdvancedOpen(!advancedOpen)}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <Settings2 size={16} />
+            <span>Pengaturan Lanjutan (Reframing & Subtitle)</span>
+          </div>
+          {advancedOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+        </button>
+
+        {advancedOpen && (
+          <div className="disclosure-body">
+            <div>
+              <label className="form-label" htmlFor="reframe-mode">
+                Strategi Reframing 9:16
+              </label>
+              <select
+                id="reframe-mode"
+                className="select-input"
+                value={reframeMode}
+                onChange={(e) => setReframeMode(e.target.value as any)}
+                disabled={busy}
+              >
+                <option value="auto">Auto (Deteksi Tata Letak & Active Speaker)</option>
+                <option value="speaker_focus">Speaker Focus (Fokus Wajah Pembicara)</option>
+                <option value="split_stack">Split & Stack (Tumpuk Atas-Bawah untuk Podcast)</option>
+                <option value="center_crop">Center Crop (Potong Tengah Klasik)</option>
+              </select>
+              <p className="form-helper">
+                Algoritma pelacakan wajah cerdas menggunakan model pengenalan posisi wajah per frame.
+              </p>
+            </div>
+
+            {onOpenSettings && (
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingTop: '0.5rem' }}>
+                <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>
+                  Gaya Font & Animasi Karaoke
+                </span>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  style={{ fontSize: '0.78rem', padding: '0.35rem 0.75rem' }}
+                  onClick={onOpenSettings}
+                >
+                  Buka Pengaturan Subtitle →
+                </button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Submit Button */}
-      <p className="form-helper" style={{ marginTop: '1rem', marginBottom: '0.5rem' }}>
-        Setelah job dibuat, halaman progres menampilkan estimasi waktu proses (perkiraan berdasarkan durasi video).
-      </p>
       <button
         type="submit"
         className="btn-primary"
         disabled={busy}
+        style={{ marginTop: '1.25rem', width: '100%', padding: '0.85rem 1.25rem', fontSize: '1rem', fontWeight: 600 }}
       >
-        {isSubmitting ? 'Mengirim Permintaan...' : 'Mulai Proses Generate Klip'}
+        {isSubmitting ? (
+          <>
+            <Loader2 size={18} className="spinner" style={{ marginRight: '8px' }} />
+            Mengirim Permintaan Job...
+          </>
+        ) : (
+          <>
+            <Film size={18} style={{ marginRight: '8px' }} />
+            Mulai Generate Klip Video
+          </>
+        )}
       </button>
     </form>
   );

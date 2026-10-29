@@ -31,6 +31,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
+# Omitted keyword leaves the stored value untouched; explicit None clears it.
+_UNSET = object()
+
 
 def resolve_db_path(default: str = "storage/clipper.db") -> str:
     """Resolve SQLite path via CLIPPER_DB_PATH (fallback to default when invalid)."""
@@ -51,7 +54,9 @@ class JobRow(Base):
     youtube_url: Mapped[str] = mapped_column(Text, nullable=False)
     selection_mode: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="queued")
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     progress_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -67,6 +72,7 @@ class JobRow(Base):
     eta_low_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     eta_high_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     stage_timings: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    download_state: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
 
 class ClipRow(Base):
@@ -74,7 +80,10 @@ class ClipRow(Base):
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     job_id: Mapped[str] = mapped_column(
-        String(64), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False, index=True
+        String(64),
+        ForeignKey("jobs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     segment_start: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     segment_end: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -93,7 +102,9 @@ class LlmKeyRow(Base):
     encrypted_key: Mapped[str] = mapped_column(Text, nullable=False)
     model: Mapped[str | None] = mapped_column(Text, nullable=True)
     base_url: Mapped[str | None] = mapped_column(Text, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
     last_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_verified_ok: Mapped[bool | None] = mapped_column(nullable=True)
 
@@ -105,7 +116,9 @@ class AppSettingRow(Base):
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
 
 
 class StageMetricRow(Base):
@@ -119,7 +132,27 @@ class StageMetricRow(Base):
     duration_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     work_units: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     config_key: Mapped[str] = mapped_column(String(128), nullable=False, default="")
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+
+
+class ClipEditRow(Base):
+    """Fase F: per-clip editor state (words, style, layout, hook, revision)."""
+
+    __tablename__ = "clip_edits"
+
+    clip_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    project_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    words_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    style_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    layout_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    hook_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    hook_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
 
 
 @dataclass
@@ -147,6 +180,7 @@ class JobRecord:
     eta_low_seconds: int | None = None
     eta_high_seconds: int | None = None
     stage_timings: list[dict[str, Any]] | None = None
+    download_state: dict[str, Any] | None = None
 
 
 class JobStore:
@@ -173,7 +207,9 @@ class JobStore:
         Base.metadata.create_all(self._engine)
         # Lightweight migration for pre-existing DB files (new nullable columns).
         with self._engine.begin() as conn:
-            cols = [r[1] for r in conn.exec_driver_sql("PRAGMA table_info(jobs)").fetchall()]
+            cols = [
+                r[1] for r in conn.exec_driver_sql("PRAGMA table_info(jobs)").fetchall()
+            ]
             if "progress_log" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN progress_log JSON")
             if "options" not in cols:
@@ -183,17 +219,33 @@ class JobStore:
             if "finished_at" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN finished_at DATETIME")
             if "current_stage" not in cols:
-                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN current_stage VARCHAR(64)")
+                conn.exec_driver_sql(
+                    "ALTER TABLE jobs ADD COLUMN current_stage VARCHAR(64)"
+                )
             if "stage_progress" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN stage_progress FLOAT")
             if "eta_seconds" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_seconds INTEGER")
             if "eta_low_seconds" not in cols:
-                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_low_seconds INTEGER")
+                conn.exec_driver_sql(
+                    "ALTER TABLE jobs ADD COLUMN eta_low_seconds INTEGER"
+                )
             if "eta_high_seconds" not in cols:
-                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN eta_high_seconds INTEGER")
+                conn.exec_driver_sql(
+                    "ALTER TABLE jobs ADD COLUMN eta_high_seconds INTEGER"
+                )
             if "stage_timings" not in cols:
                 conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN stage_timings JSON")
+            if "download_state" not in cols:
+                conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN download_state JSON")
+            edit_cols = [
+                r[1]
+                for r in conn.exec_driver_sql("PRAGMA table_info(clip_edits)").fetchall()
+            ]
+            if "project_json" not in edit_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE clip_edits ADD COLUMN project_json JSON"
+                )
         self._sessions = sessionmaker(bind=self._engine, expire_on_commit=False)
         self._lock = threading.Lock()
 
@@ -235,6 +287,7 @@ class JobStore:
             eta_low_seconds=job.eta_low_seconds,
             eta_high_seconds=job.eta_high_seconds,
             stage_timings=list(job.stage_timings or []),
+            download_state=job.download_state,
         )
 
     def create_job(
@@ -282,6 +335,7 @@ class JobStore:
         eta_low_seconds: int | None = None,
         eta_high_seconds: int | None = None,
         stage_timings: list[dict[str, Any]] | None = None,
+        download_state: Any = _UNSET,
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
     ) -> JobRecord | None:
@@ -310,6 +364,8 @@ class JobStore:
                 job.eta_high_seconds = eta_high_seconds
             if stage_timings is not None:
                 job.stage_timings = stage_timings
+            if download_state is not _UNSET:
+                job.download_state = download_state
             if started_at is not None:
                 job.started_at = started_at
             if finished_at is not None:
@@ -329,7 +385,9 @@ class JobStore:
             if not job:
                 return
             log = list(job.progress_log or [])
-            log.append({"t": _dt.utcnow().isoformat(timespec="seconds"), "msg": message})
+            log.append(
+                {"t": _dt.utcnow().isoformat(timespec="seconds"), "msg": message}
+            )
             job.progress_log = log[-max_entries:]
             session.commit()
 
@@ -339,7 +397,14 @@ class JobStore:
                 clip_id = c.get("id")
                 if not clip_id:
                     continue
-                known = {"id", "segmentStart", "segmentEnd", "format", "downloadUrl", "filePath"}
+                known = {
+                    "id",
+                    "segmentStart",
+                    "segmentEnd",
+                    "format",
+                    "downloadUrl",
+                    "filePath",
+                }
                 row = ClipRow(
                     id=clip_id,
                     job_id=job_id,
@@ -358,16 +423,34 @@ class JobStore:
             row = session.get(ClipRow, clip_id)
             return self._clip_to_dict(row) if row else None
 
+    def update_clip_file(
+        self,
+        clip_id: str,
+        file_path: str,
+        extra_updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock, self._sessions() as session:
+            row = session.get(ClipRow, clip_id)
+            if not row:
+                return None
+            row.file_path = file_path
+            if extra_updates:
+                merged = dict(row.extra or {})
+                merged.update(extra_updates)
+                row.extra = merged
+            session.commit()
+            return self._clip_to_dict(row)
+
     def get_all_jobs(self) -> list[JobRecord]:
         with self._sessions() as session:
             jobs = session.scalars(select(JobRow)).all()
-            records = []
-            for job in jobs:
-                clips = session.scalars(
-                    select(ClipRow).where(ClipRow.job_id == job.id)
-                ).all()
-                records.append(self._to_record(job, list(clips)))
-            return records
+            if not jobs:
+                return []
+            all_clips = session.scalars(select(ClipRow)).all()
+            clips_by_job: dict[str, list[ClipRow]] = {}
+            for clip in all_clips:
+                clips_by_job.setdefault(clip.job_id, []).append(clip)
+            return [self._to_record(job, clips_by_job.get(job.id, [])) for job in jobs]
 
     def remove_job(self, job_id: str) -> JobRecord | None:
         """Remove a job and its clips (Fase 2 Iterasi 2.1: TTL garbage collection)."""
@@ -384,8 +467,46 @@ class JobStore:
             session.commit()
             return record
 
+    def fail_orphaned_jobs(
+        self, reason: str = "Server restart / crash tak terduga."
+    ) -> list[str]:
+        """Tandai job yang tertahan di status non-terminal saat server baru startup."""
+        non_terminal = (
+            "queued",
+            "downloading",
+            "transcribing",
+            "selecting_segments",
+            "rendering",
+        )
+        updated_ids: list[str] = []
+        with self._lock, self._sessions() as session:
+            jobs = session.scalars(
+                select(JobRow).where(JobRow.status.in_(non_terminal))
+            ).all()
+            for job in jobs:
+                stage = job.current_stage or job.status
+                job.status = "failed"
+                job.error_stage = stage
+                job.error_message = (
+                    f"{reason} Terhenti pada tahap '{stage}'. Cek logs/crash.log."
+                )
+                job.finished_at = datetime.utcnow()
+                log = list(job.progress_log or [])
+                log.append(
+                    {
+                        "t": datetime.utcnow().isoformat(timespec="seconds"),
+                        "msg": f"[RECOVERY] Job ditandai gagal setelah server restart: {job.error_message}",
+                    }
+                )
+                job.progress_log = log
+                updated_ids.append(job.id)
+            if updated_ids:
+                session.commit()
+        return updated_ids
+
     def clear(self) -> None:
         with self._lock, self._sessions() as session:
+            session.execute(delete(ClipEditRow))
             session.execute(delete(ClipRow))
             session.execute(delete(JobRow))
             session.execute(delete(LlmKeyRow))
@@ -433,19 +554,39 @@ class JobStore:
             row.updated_at = now
             session.commit()
 
+    OBSOLETE_LLM_MODELS: dict[str, dict[str, str]] = {
+        "openrouter": {
+            "qwen/qwq-32b:free": "nvidia/nemotron-3.5-lightning:free",
+            "meta-llama/llama-3.3-70b-instruct:free": "nvidia/nemotron-3.5-lightning:free",
+            "google/gemini-2.0-flash-exp:free": "nvidia/nemotron-3.5-lightning:free",
+            "deepseek/deepseek-chat-v3-0324:free": "nvidia/nemotron-3.5-lightning:free",
+        }
+    }
+
     def get_llm_key(self, provider: str) -> LlmKeyRow | None:
         with self._sessions() as session:
             row = session.get(LlmKeyRow, provider)
             if row is None:
                 return None
+            obsolete_map = self.OBSOLETE_LLM_MODELS.get(provider, {})
+            if row.model in obsolete_map:
+                row.model = obsolete_map[row.model]
+                session.commit()
             session.expunge(row)
             return row
 
     def list_llm_keys(self) -> list[LlmKeyRow]:
         with self._sessions() as session:
             rows = session.scalars(select(LlmKeyRow)).all()
+            dirty = False
             for row in rows:
+                obsolete_map = self.OBSOLETE_LLM_MODELS.get(row.provider, {})
+                if row.model in obsolete_map:
+                    row.model = obsolete_map[row.model]
+                    dirty = True
                 session.expunge(row)
+            if dirty:
+                session.commit()
             return list(rows)
 
     def delete_llm_key(self, provider: str) -> bool:
@@ -465,6 +606,23 @@ class JobStore:
             row.last_verified_at = datetime.utcnow()
             row.last_verified_ok = ok
             session.commit()
+
+    def update_llm_key_model(
+        self,
+        provider: str,
+        model: str,
+        base_url: str | None = None,
+    ) -> bool:
+        with self._lock, self._sessions() as session:
+            row = session.get(LlmKeyRow, provider)
+            if row is None:
+                return False
+            row.model = model
+            if base_url is not None:
+                row.base_url = base_url
+            row.updated_at = datetime.utcnow()
+            session.commit()
+            return True
 
     # -- Stage metrics for ETA predictions and diagnostics --
 
@@ -503,6 +661,63 @@ class JobStore:
                 for stage, durs in by_stage.items()
             }
             return {"stages": summary, "totalRecords": len(rows)}
+
+    # -- Fase F: clip edits --
+    def get_clip_edit(self, clip_id: str) -> dict | None:
+        with self._sessions() as session:
+            row = session.get(ClipEditRow, clip_id)
+            if not row:
+                return None
+            return {
+                "clip_id": row.clip_id,
+                "project_json": row.project_json,
+                "words_json": row.words_json,
+                "style_json": row.style_json,
+                "layout_json": row.layout_json,
+                "hook_text": row.hook_text,
+                "hook_json": row.hook_json,
+                "revision": row.revision,
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+
+    def save_clip_edit(
+        self,
+        clip_id: str,
+        payload: dict,
+        expected_revision: int | None = None,
+        force: bool = False,
+    ) -> dict | None:
+        """Returns row dict, or None on revision conflict."""
+        with self._lock, self._sessions() as session:
+            row = session.get(ClipEditRow, clip_id)
+            if row is None:
+                if not force and expected_revision not in (None, 1):
+                    return None
+                row = ClipEditRow(clip_id=clip_id, revision=1)
+                session.add(row)
+            elif (
+                not force
+                and expected_revision is not None
+                and row.revision != expected_revision
+            ):
+                return None
+            else:
+                row.revision = (row.revision or 1) + 1
+            if "project_json" in payload:
+                row.project_json = payload["project_json"]
+            if "words_json" in payload:
+                row.words_json = payload["words_json"]
+            if "style_json" in payload:
+                row.style_json = payload["style_json"]
+            if "layout_json" in payload:
+                row.layout_json = payload["layout_json"]
+            if "hook_text" in payload:
+                row.hook_text = payload["hook_text"]
+            if "hook_json" in payload:
+                row.hook_json = payload["hook_json"]
+            row.updated_at = datetime.utcnow()
+            session.commit()
+            return {"clip_id": row.clip_id, "revision": row.revision}
 
 
 # Global singleton instance for the app

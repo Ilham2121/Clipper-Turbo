@@ -7,6 +7,8 @@ import {
   Sparkles,
   RotateCcw,
   Film,
+  Clock,
+  Sliders,
 } from 'lucide-react';
 import type { ClipInfo } from '../api/client';
 import { buildCaptionText, copyCaption, getClipDownloadUrl } from '../api/client';
@@ -15,7 +17,9 @@ import { useToast } from './Toast';
 interface ClipResultsProps {
   clips: ClipInfo[];
   onReset: () => void;
+  onEditClip: (clipId: string) => void;
   jobId?: string;
+  cacheBust?: number;
 }
 
 function formatDuration(seconds: number): string {
@@ -26,9 +30,19 @@ function formatDuration(seconds: number): string {
   return `${mm}:${ss}`;
 }
 
-export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId }) => {
+export const ClipResults: React.FC<ClipResultsProps> = ({
+  clips,
+  onReset,
+  onEditClip,
+  jobId,
+  cacheBust,
+}) => {
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<'score' | 'time'>('score');
   const toast = useToast();
+  const ordered = [...clips].sort((a, b) =>
+    sortBy === 'score' ? (b.viralityScore ?? 0) - (a.viralityScore ?? 0) : a.segmentStart - b.segmentStart,
+  );
 
   const handleCopy = async (clip: ClipInfo) => {
     const ok = await copyCaption(clip);
@@ -45,14 +59,14 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
     <div className="card" style={{ animation: 'fadeIn 0.25s ease-out' }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.25rem' }}>
         <h2 className="card-title" style={{ margin: 0 }}>
-          Galeri Hasil Klip Video
+          Hasil Klip Viral
         </h2>
         <span className="badge-pill badge-pill-hw">
           <Film size={12} /> {clips.length} Klip Siap
         </span>
       </div>
       <p className="card-description">
-        Klip video telah selesai dipotong, di-reframe, dan dilengkapi subtitle animasi per kata.
+        Klip selesai di-reframe dan siap diunggah ke TikTok, Reels, & Shorts.
       </p>
 
       {/* Action Header Banner */}
@@ -64,7 +78,7 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
             className="btn-primary btn-inline"
             style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}
           >
-            <Download size={16} /> Download Semua Klip (.zip)
+            <Download size={16} /> Download Semua (.ZIP)
           </a>
         )}
         <button
@@ -73,17 +87,45 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
           onClick={onReset}
           style={{ display: 'inline-flex', alignItems: 'center', gap: '0.5rem' }}
         >
-          <RotateCcw size={15} /> Buat Job Klip Baru
+          <RotateCcw size={15} /> Buat Klip Baru
         </button>
       </div>
 
       {/* Grid of Generated Clips */}
+      <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '0.75rem', alignItems: 'center' }}>
+        <span style={{ fontSize: '0.8rem', color: 'var(--fg-muted)', marginRight: '0.25rem' }}>Urutkan:</span>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => setSortBy('score')}
+          disabled={sortBy === 'score'}
+          style={{ opacity: sortBy === 'score' ? 0.6 : 1 }}
+        >
+          <Sparkles size={13} />
+          <span>Skor Tertinggi</span>
+        </button>
+        <button
+          type="button"
+          className="btn-secondary"
+          onClick={() => setSortBy('time')}
+          disabled={sortBy === 'time'}
+          style={{ opacity: sortBy === 'time' ? 0.6 : 1 }}
+        >
+          <Clock size={13} />
+          <span>Waktu Video</span>
+        </button>
+      </div>
       <div className="clips-grid">
-        {clips.map((clip) => {
-          const downloadUrl = clip.downloadUrl || getClipDownloadUrl(clip.id);
+        {ordered.map((clip) => {
+          const baseDownloadUrl = clip.downloadUrl || getClipDownloadUrl(clip.id);
+          const downloadUrl = cacheBust
+            ? `${baseDownloadUrl}${baseDownloadUrl.includes('?') ? '&' : '?'}t=${cacheBust}`
+            : baseDownloadUrl;
           const is916 = clip.format === '9:16';
           const duration = clip.segmentEnd - clip.segmentStart;
           const score = clip.viralityScore;
+          const score10 = score != null ? (score / 10).toFixed(1) : null;
+          const scoreColor = score != null && score >= 80 ? 'rgba(228, 255, 69, 0.14)' : score != null && score >= 60 ? 'rgba(255, 255, 255, 0.08)' : 'rgba(255, 255, 255, 0.04)';
 
           return (
             <div key={clip.id} className={`clip-card ${is916 ? 'ratio-9-16' : ''}`}>
@@ -117,33 +159,28 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
                       alignItems: 'center',
                       gap: '0.5rem',
                       padding: '0.4rem 0.6rem',
-                      background:
-                        score >= 80
-                          ? 'rgba(16, 185, 129, 0.12)'
-                          : score >= 60
-                          ? 'rgba(99, 102, 241, 0.12)'
-                          : 'rgba(255, 255, 255, 0.05)',
+                      background: scoreColor,
                       borderRadius: 'var(--radius-sm)',
                       border: `1px solid ${
                         score >= 80
-                          ? 'rgba(16, 185, 129, 0.3)'
+                          ? 'rgba(228, 255, 69, 0.35)'
                           : score >= 60
-                          ? 'rgba(99, 102, 241, 0.3)'
+                          ? 'rgba(255, 255, 255, 0.15)'
                           : 'rgba(255, 255, 255, 0.08)'
                       }`,
                     }}
                   >
                     <Sparkles
                       size={14}
-                      color={score >= 80 ? 'var(--status-success)' : 'var(--accent-primary)'}
+                      color={score >= 80 ? 'var(--accent)' : 'var(--fg-muted)'}
                     />
                     <strong
                       style={{
                         fontSize: '0.8rem',
-                        color: score >= 80 ? '#6ee7b7' : '#a5b4fc',
+                        color: score >= 80 ? 'var(--accent)' : 'var(--fg)',
                       }}
                     >
-                      Virality {score}/100
+                      Virality {score10}/10
                     </strong>
                     {clip.hook && (
                       <span
@@ -210,8 +247,17 @@ export const ClipResults: React.FC<ClipResultsProps> = ({ clips, onReset, jobId 
                   className="btn-download"
                   style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem' }}
                 >
-                  <Download size={15} /> Unduh Klip (.mp4)
+                  <Download size={15} /> Unduh MP4
                 </a>
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  onClick={() => onEditClip(clip.id)}
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.4rem' }}
+                >
+                  <Sliders size={13} />
+                  <span>Edit Klip</span>
+                </button>
               </div>
             </div>
           );

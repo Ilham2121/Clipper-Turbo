@@ -1,26 +1,31 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Settings,
+  Settings2,
   Sparkles,
-  Zap,
-  Smartphone,
-  FileText,
+  Film,
+  Clock,
+  Subtitles,
   Activity,
   Wifi,
   WifiOff,
 } from 'lucide-react';
 import type { CreateJobFormData, JobStatusResponse } from './api/client';
-import { createJob, getJobStatus, subscribeJobEvents } from './api/client';
+import { createJob, getJobStatus, isJobNotFoundError, subscribeJobEvents } from './api/client';
 import { JobForm } from './components/JobForm';
 import { JobProgress } from './components/JobProgress';
 import { ClipResults } from './components/ClipResults';
+import type { SettingsTab } from './components/SettingsModal';
 import { SettingsModal } from './components/SettingsModal';
-import { ToastProvider } from './components/Toast';
+import { ToastProvider, useToast } from './components/Toast';
+import type { ParsedJobError } from './api/errorParser';
+import { parseJobError } from './api/errorParser';
 import type { HistoryEntry } from './history';
 import { clearHistory, loadHistory, removeEntry, upsertEntry } from './history';
 import { clearActiveJob, loadActiveJob, saveActiveJob } from './activeJob';
+import { ClipEditorPage } from './editor/ClipEditorPage';
 
-export const AppContent: React.FC = () => {
+const AppContent: React.FC = () => {
+  const toast = useToast();
   const restoredJob = loadActiveJob();
   const [currentJobId, setCurrentJobId] = useState<string | null>(restoredJob?.jobId ?? null);
   const [jobStatus, setJobStatus] = useState<JobStatusResponse | null>(
@@ -30,11 +35,17 @@ export const AppContent: React.FC = () => {
   const [serverOnline, setServerOnline] = useState<boolean | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory());
   const [settingsOpen, setSettingsOpen] = useState<boolean>(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('subtitle');
   const [currentJobUrl, setCurrentJobUrl] = useState<string>(restoredJob?.youtubeUrl ?? '');
+  const [failedJobError, setFailedJobError] = useState<ParsedJobError | null>(null);
+  const [editingClipId, setEditingClipId] = useState<string | null>(null);
+  const [clipCacheBust, setClipCacheBust] = useState<number>(0);
 
   const pollTimerRef = useRef<number | null>(null);
   const lastJobUrlRef = useRef<string>('');
+  const lastJobTitleRef = useRef<string>('');
   const progressAnchorRef = useRef<HTMLDivElement>(null);
+  const notifiedFailedJobIdRef = useRef<string | null>(null);
 
   // Health check polling backend status
   const checkHealth = () => {
@@ -52,7 +63,7 @@ export const AppContent: React.FC = () => {
     return () => window.clearInterval(interval);
   }, []);
 
-  // Poll job status (AC-9, AC-12)
+  // Poll job status
   useEffect(() => {
     if (!currentJobId) return;
 
@@ -70,10 +81,19 @@ export const AppContent: React.FC = () => {
 
         pollTimerRef.current = window.setTimeout(poll, 2000);
       } catch (err) {
-        console.error('Error polling job status:', err);
-        if (isSubscribed) {
-          pollTimerRef.current = window.setTimeout(poll, 3000);
+        if (!isSubscribed) return;
+        if (isJobNotFoundError(err)) {
+          // Job benar-benar hilang dari server -> hentikan polling,
+          // tampilkan info transien di status eksisiting.
+          console.warn('Job tidak ditemukan di server (404), polling dihentikan.');
+          setJobStatus((prev) =>
+            prev ?? { jobId: currentJobId, status: 'failed', progressPercent: 0, clips: [] },
+          );
+          clearActiveJob();
+          return;
         }
+        console.error('Error polling job status:', err);
+        pollTimerRef.current = window.setTimeout(poll, 3000);
       }
     };
 
@@ -101,6 +121,7 @@ export const AppContent: React.FC = () => {
         return upsertEntry({
           jobId: jobStatus.jobId,
           youtubeUrl: lastJobUrlRef.current,
+          title: lastJobTitleRef.current || undefined,
           createdAt: new Date().toISOString(),
           status: jobStatus.status,
           clips: jobStatus.clips ?? [],
@@ -115,6 +136,17 @@ export const AppContent: React.FC = () => {
     }
   }, [jobStatus?.status]);
 
+  // Trigger failure toast once per failed job
+  useEffect(() => {
+    if (jobStatus?.status === 'failed' && currentJobId) {
+      if (notifiedFailedJobIdRef.current !== currentJobId) {
+        notifiedFailedJobIdRef.current = currentJobId;
+        const parsed = parseJobError(jobStatus.error, jobStatus.stage || undefined);
+        toast.error(`Job Gagal: ${parsed.title}`, parsed.friendlyMessage);
+      }
+    }
+  }, [jobStatus?.status, jobStatus?.error, jobStatus?.stage, currentJobId, toast]);
+
   useEffect(() => {
     if (!restoredJob) return;
     let cancelled = false;
@@ -126,12 +158,19 @@ export const AppContent: React.FC = () => {
         }
         setJobStatus(fresh);
       })
-      .catch(() => {
-        if (!cancelled) {
+      .catch((err) => {
+        // 404 = job benar-benar hilang (dihapus/TTL) -> reset ke tampilan kosong.
+        // Error lain (koneksi/server 5xx) = transien -> pertahankan job & coba lagi.
+        if (cancelled) return;
+        if (isJobNotFoundError(err)) {
           clearActiveJob();
           setCurrentJobId(null);
           setJobStatus(null);
+          return;
         }
+        setJobStatus((prev) =>
+          prev ?? { jobId: restoredJob.jobId, status: 'queued', progressPercent: 0, clips: [] },
+        );
       });
     return () => {
       cancelled = true;
@@ -146,6 +185,7 @@ export const AppContent: React.FC = () => {
 
   const handleSelectHistory = async (entry: HistoryEntry) => {
     setSettingsOpen(false);
+    setFailedJobError(null);
     setCurrentJobId(entry.jobId);
     setCurrentJobUrl(entry.youtubeUrl || '');
     try {
@@ -168,11 +208,13 @@ export const AppContent: React.FC = () => {
     scrollToProgress();
   };
 
-  const handleStartJob = async (payload: CreateJobFormData) => {
+  const handleStartJob = async (payload: CreateJobFormData, meta?: { videoTitle?: string }) => {
     setIsSubmitting(true);
+    setFailedJobError(null);
     try {
       const resp = await createJob(payload);
       lastJobUrlRef.current = payload.youtubeUrl;
+      lastJobTitleRef.current = meta?.videoTitle ?? '';
       setCurrentJobUrl(payload.youtubeUrl);
       setCurrentJobId(resp.jobId);
       setJobStatus({
@@ -183,9 +225,33 @@ export const AppContent: React.FC = () => {
       });
       saveActiveJob({ jobId: resp.jobId, youtubeUrl: payload.youtubeUrl });
       scrollToProgress();
+    } catch (err: any) {
+      const errMsg = err?.message || 'Gagal memulai job baru.';
+      toast.error('Gagal Memulai Job', errMsg);
+      setFailedJobError({
+        stage: 'system',
+        stageLabel: 'Inisialisasi Job',
+        title: 'Gagal Memulai Job',
+        friendlyMessage: errMsg,
+        technicalDetail: String(err),
+        suggestion: 'Pastikan koneksi server backend Clipper Turbo aktif dan parameter video valid.',
+      });
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleRetryJob = () => {
+    if (pollTimerRef.current) {
+      clearTimeout(pollTimerRef.current);
+    }
+    clearActiveJob();
+    if (jobStatus?.status === 'failed') {
+      const parsed = parseJobError(jobStatus.error, jobStatus.stage || undefined);
+      setFailedJobError(parsed);
+    }
+    setCurrentJobId(null);
+    setJobStatus(null);
   };
 
   const handleReset = () => {
@@ -196,16 +262,45 @@ export const AppContent: React.FC = () => {
     setCurrentJobId(null);
     setJobStatus(null);
     setCurrentJobUrl('');
+    setFailedJobError(null);
   };
 
   const handleClearView = handleReset;
 
+  const handleOpenSettingsTab = (tab: SettingsTab) => {
+    setSettingsTab(tab);
+    setSettingsOpen(true);
+  };
+
+  const handleClipUpdated = async () => {
+    setClipCacheBust(Date.now());
+    if (currentJobId) {
+      try {
+        const fresh = await getJobStatus(currentJobId);
+        setJobStatus(fresh);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
   const isJobCompleted = !!(jobStatus && jobStatus.status === 'completed' && jobStatus.clips && jobStatus.clips.length > 0);
-  const isJobRunning = !!(currentJobId && jobStatus && !isJobCompleted && jobStatus.status !== 'failed');
+  const showJobProgress = !!(currentJobId && jobStatus && !isJobCompleted);
+  const isJobRunning = !!(showJobProgress && jobStatus?.status !== 'failed');
+
+  if (editingClipId) {
+    return (
+      <ClipEditorPage
+        clipId={editingClipId}
+        onClose={() => setEditingClipId(null)}
+        onClipUpdated={() => void handleClipUpdated()}
+      />
+    );
+  }
 
   return (
     <div className="app-container">
-      {/* Top Header */}
+      {/* Top Header with Modern SaaS Navigation Tabs */}
       <header className="header">
         <div className="brand">
           <div className="brand-icon">
@@ -213,22 +308,53 @@ export const AppContent: React.FC = () => {
           </div>
           <div>
             <h1 className="brand-title">Clipper Turbo</h1>
-            <p className="brand-subtitle">Automated YouTube Studio & AI Reframe</p>
+            <p className="brand-subtitle">Clip video viral. Langsung dari laptop kamu.</p>
           </div>
         </div>
 
-        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
+        {/* Central SaaS Nav Tabs */}
+        <nav className="nav-tabs" role="tablist">
           <button
             type="button"
-            className="btn-secondary icon-btn"
-            onClick={() => setSettingsOpen(true)}
-            aria-label="Pengaturan Studio"
-            title="Pengaturan: Riwayat, Storage, Subtitle, ASR, Diagnostik"
+            className="nav-tab-btn active"
+            onClick={handleClearView}
+            title="Studio Pembuatan Klip"
           >
-            <Settings size={18} />
-            {history.length > 0 && <span className="icon-btn-badge">{history.length}</span>}
+            <Film size={15} />
+            <span>Studio</span>
           </button>
+          <button
+            type="button"
+            className="nav-tab-btn"
+            onClick={() => handleOpenSettingsTab('history')}
+            title="Riwayat Klip & Proyek"
+          >
+            <Clock size={15} />
+            <span>Riwayat & Proyek</span>
+            {history.length > 0 && <span className="nav-tab-badge">{history.length}</span>}
+          </button>
+          <button
+            type="button"
+            className="nav-tab-btn"
+            onClick={() => handleOpenSettingsTab('subtitle')}
+            title="Kustomisasi Gaya & Animasi Subtitle"
+          >
+            <Subtitles size={15} />
+            <span>Subtitle Studio</span>
+          </button>
+          <button
+            type="button"
+            className="nav-tab-btn"
+            onClick={() => handleOpenSettingsTab('keys')}
+            title="Pengaturan API Key, Storage, dan GPU"
+          >
+            <Settings2 size={15} />
+            <span>Pengaturan & GPU</span>
+          </button>
+        </nav>
 
+        {/* Right Status */}
+        <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center' }}>
           <div
             className="server-status"
             onClick={checkHealth}
@@ -265,70 +391,55 @@ export const AppContent: React.FC = () => {
         </div>
       </header>
 
-      {/* Main Workspace — Two-Pane Layout on Desktop (Phase 5 / Note 5) */}
-      <main className="workspace-grid">
-        {/* Left Column: Job Composer (Sticky) */}
-        <aside className="workspace-sidebar">
+      {/* Main Full-Width Studio Workspace */}
+      <main style={{ minHeight: '60vh' }}>
+        {/* State 1: Active Processing or Failed Mission Control */}
+        {showJobProgress && jobStatus && (
+          <div ref={progressAnchorRef} className="mission-control-box">
+            <JobProgress
+              key={jobStatus.jobId}
+              status={jobStatus}
+              onReset={handleReset}
+              onRetry={handleRetryJob}
+              onOpenSettings={(tab) => handleOpenSettingsTab(tab as SettingsTab)}
+              youtubeUrl={currentJobUrl || undefined}
+            />
+          </div>
+        )}
+
+        {/* State 2: Results Gallery Showcase */}
+        {isJobCompleted && jobStatus?.clips && (
+          <div style={{ animation: 'fadeIn 0.25s ease-out' }}>
+            <ClipResults
+              clips={jobStatus.clips}
+              onReset={handleReset}
+              onEditClip={setEditingClipId}
+              jobId={jobStatus.jobId}
+              cacheBust={clipCacheBust}
+            />
+          </div>
+        )}
+
+        {/* State 3: Creation Studio Console (when idle or retrying/resetting) */}
+        {!showJobProgress && !isJobCompleted && (
           <JobForm
             onSubmit={handleStartJob}
             isSubmitting={isSubmitting}
             disabled={isJobRunning}
-            onOpenSettings={() => setSettingsOpen(true)}
+            onOpenSettings={() => handleOpenSettingsTab('keys')}
+            onOpenSubtitles={() => handleOpenSettingsTab('subtitle')}
+            initialUrl={currentJobUrl}
+            failedJobError={failedJobError}
+            onDismissFailedError={() => setFailedJobError(null)}
           />
-        </aside>
-
-        {/* Right Column: Live Stepper, Progress Log & Results Gallery */}
-        <section className="workspace-content">
-          {/* Active Job Progress */}
-          {currentJobId && jobStatus && (
-            <div ref={progressAnchorRef} className="progress-panel-anchor">
-              <JobProgress
-                key={jobStatus.jobId}
-                status={jobStatus}
-                onReset={handleClearView}
-                youtubeUrl={currentJobUrl || undefined}
-              />
-            </div>
-          )}
-
-          {/* Results Gallery */}
-          {isJobCompleted && jobStatus?.clips && (
-            <ClipResults clips={jobStatus.clips} onReset={handleClearView} jobId={jobStatus.jobId} />
-          )}
-
-          {/* Studio Empty State when idle */}
-          {!currentJobId && (
-            <div className="studio-empty-state">
-              <div className="studio-empty-icon">
-                <Sparkles size={28} />
-              </div>
-              <h3 className="studio-empty-title">Studio Siap Digunakan</h3>
-              <p className="studio-empty-desc">
-                Masukkan URL video YouTube di sebelah kiri. Sistem akan mengunduh video, menganalisis transkrip
-                dengan AI, melakukan reframing wajah dinamis, dan membakar subtitle animasi per-kata.
-              </p>
-              <div className="studio-features-list">
-                <span className="studio-feature-chip">
-                  <Zap size={12} color="var(--accent-primary)" /> Akselerasi HW (NVENC/QSV)
-                </span>
-                <span className="studio-feature-chip">
-                  <Smartphone size={12} color="var(--accent-secondary)" /> Dynamic 9:16 Reframing
-                </span>
-                <span className="studio-feature-chip">
-                  <FileText size={12} color="#10b981" /> Word-Synced Karaoke Subtitles
-                </span>
-                <span className="studio-feature-chip">
-                  <Sparkles size={12} color="#f59e0b" /> Virality Scoring AI
-                </span>
-              </div>
-            </div>
-          )}
-        </section>
+        )}
       </main>
 
-      {/* Floating Centered Settings Modal (Note 3 / Phase 4.2) */}
+      {/* Settings, Subtitles, History & Diagnostics Modal */}
       <SettingsModal
+        key={settingsTab}
         open={settingsOpen}
+        initialTab={settingsTab}
         entries={history}
         onSelectHistory={handleSelectHistory}
         onRemoveHistory={(jobId) => setHistory(removeEntry(jobId))}
@@ -339,7 +450,7 @@ export const AppContent: React.FC = () => {
   );
 };
 
-export const App: React.FC = () => {
+const App: React.FC = () => {
   return (
     <ToastProvider>
       <AppContent />

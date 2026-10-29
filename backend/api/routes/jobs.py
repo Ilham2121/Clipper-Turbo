@@ -7,15 +7,14 @@ Traces to: PRD §7 (API Contracts: POST /api/jobs, GET /api/jobs/:jobId),
 """
 
 import asyncio
-import io
 import os
+import tempfile
 import uuid
 import zipfile
-from collections.abc import AsyncIterator
-from fastapi import APIRouter, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse, Response, StreamingResponse
-
-from fastapi import Query
+from collections.abc import AsyncIterator, Iterator
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse, StreamingResponse
 
 from backend.api.schemas import (
     ClipInfo,
@@ -28,22 +27,31 @@ from backend.api.schemas import (
 )
 from backend.core.config import decrypt_at_rest
 from backend.core.eta import ETAPredictor
+from backend.core.limiter import job_limiter
 from backend.models.db import db
 from backend.pipeline.ingest import probe_video_metadata, validate_youtube_url
-from backend.pipeline.pipeline import run_pipeline
+from backend.pipeline.pipeline import _download_status_fields, run_pipeline
 from backend.pipeline.render import detect_available_video_codec
+from backend.pipeline.selectors.llm_selector import LLMSelector
 
 router = APIRouter(prefix="/api", tags=["jobs"])
 
 
 @router.get("/estimate", response_model=EstimateResponse)
-def estimate_processing_time(youtubeUrl: str = Query(..., alias="youtubeUrl")) -> EstimateResponse:
+def estimate_processing_time(
+    youtubeUrl: str = Query(..., alias="youtubeUrl"),
+) -> EstimateResponse:
     """Processing-time estimate from a metadata-only probe using reliable rate priors."""
     if not validate_youtube_url(youtubeUrl):
-        raise HTTPException(status_code=422, detail=f"Invalid YouTube URL: '{youtubeUrl}'")
+        raise HTTPException(
+            status_code=422, detail=f"Invalid YouTube URL: '{youtubeUrl}'"
+        )
     meta = probe_video_metadata(youtubeUrl)
     if not meta or not meta.get("duration"):
-        raise HTTPException(status_code=422, detail="Could not read video duration (private/deleted/rate-limited).")
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read video duration (private/deleted/rate-limited).",
+        )
     hw = detect_available_video_codec() != "libx264"
     priors = ETAPredictor.estimate_stage_priors(
         video_duration=float(meta["duration"]),
@@ -72,9 +80,22 @@ def resolve_effective_llm_key(request: CreateJobRequest) -> str | None:
     raw = (request.llm_api_key or "").strip()
     if raw:
         return raw
-    row = db.get_llm_key((request.llm_provider or "openai").lower())
+    provider = (request.llm_provider or "openai").lower()
+    row = db.get_llm_key(provider)
     if row is None:
         return None
+    req_base = (request.llm_base_url or "").strip().rstrip("/")
+    if req_base:
+        cfg = LLMSelector.PROVIDER_CONFIGS.get(provider, {})
+        allowed_bases = {
+            (row.base_url or "").strip().rstrip("/"),
+            str(cfg.get("base_url") or "").strip().rstrip("/"),
+        } - {""}
+        if req_base not in allowed_bases:
+            raise HTTPException(
+                status_code=422,
+                detail="Custom llmBaseUrl tidak diizinkan saat memakai API key tersimpan. Sertakan llmApiKey secara eksplisit.",
+            )
     try:
         return decrypt_at_rest(row.encrypted_key)
     except Exception:
@@ -84,30 +105,52 @@ def resolve_effective_llm_key(request: CreateJobRequest) -> str | None:
 @router.post("/jobs", response_model=CreateJobResponse, status_code=200)
 def create_job(
     request: CreateJobRequest,
-    background_tasks: BackgroundTasks,
 ) -> CreateJobResponse:
-    """Create a new clipping job and schedule pipeline execution in the background."""
+    """Create a new clipping job and schedule pipeline execution in the dedicated worker pool."""
     if request.selection_mode == "auto" and not resolve_effective_llm_key(request):
         provider = (request.llm_provider or "openai").lower()
         raise HTTPException(
             status_code=422,
             detail=f"LLM API key untuk provider '{provider}' belum disimpan. Simpan dulu via /api/llm-keys.",
         )
+    if job_limiter.queued_count >= job_limiter.max_queued:
+        raise HTTPException(
+            status_code=429,
+            detail="Antrean job penuh, silakan tunggu job aktif selesai.",
+        )
     job_id = str(uuid.uuid4())
+    opts = request.options if getattr(request, "options", None) else None
     db.create_job(
         job_id=job_id,
-        youtube_url=request.youtube_url,
+        youtube_url=request.youtube_url or f"upload:{getattr(opts, 'upload_id', '')}",
         selection_mode=request.selection_mode,
         options={
             "burn_subtitles": request.burn_subtitles,
             "output_formats": request.output_formats,
             "llm_provider": request.llm_provider,
             "llm_model": request.llm_model,
+            "reframe_mode": request.reframe_mode,
+            "content_type": getattr(opts, "content_type", "general"),
+            "clip_count": getattr(opts, "clip_count", 5),
+            "duration_range": getattr(opts, "duration_range", "60-90"),
+            "source_type": getattr(opts, "source_type", "youtube"),
+            "upload_id": getattr(opts, "upload_id", None),
+            "layout": getattr(opts, "layout", "smart"),
+            "hook_overlay": getattr(opts, "hook_overlay", True),
+            "watermark": getattr(opts, "watermark", False),
+            "high_accuracy_crop": getattr(opts, "high_accuracy_crop", False),
+            "language": getattr(opts, "language", None),
+            "subtitle_preset": getattr(opts, "subtitle_preset", None),
         },
     )
 
-    # AC-12: Non-blocking execution in background
-    background_tasks.add_task(run_pipeline, job_id, request)
+    # AC-12: Non-blocking execution on dedicated worker pool (prevents AnyIO threadpool starvation)
+    if not job_limiter.submit(run_pipeline, job_id, request):
+        db.remove_job(job_id)
+        raise HTTPException(
+            status_code=429,
+            detail="Antrean job penuh, silakan tunggu job aktif selesai.",
+        )
 
     return CreateJobResponse(job_id=job_id, status="queued")
 
@@ -140,6 +183,8 @@ def _build_status_payload(job_id: str) -> JobStatusResponse:
             for c in job.clips
         ]
 
+    download_fields = _download_status_fields(job.download_state or {})
+
     return JobStatusResponse(
         job_id=job.id,
         status=job.status,  # type: ignore[arg-type]
@@ -157,6 +202,12 @@ def _build_status_payload(job_id: str) -> JobStatusResponse:
         eta_low_seconds=job.eta_low_seconds,
         eta_high_seconds=job.eta_high_seconds,
         stage_timings=job.stage_timings,
+        download_speed_bps=download_fields["downloadSpeedBps"],
+        downloaded_bytes=download_fields["downloadedBytes"],
+        download_total_bytes=download_fields["downloadTotalBytes"],
+        download_eta_seconds=download_fields["downloadEtaSeconds"],
+        download_fragment_index=download_fields["downloadFragmentIndex"],
+        download_fragment_count=download_fields["downloadFragmentCount"],
     )
 
 
@@ -169,18 +220,16 @@ def get_job_status(job_id: str) -> JobStatusResponse:
 @router.get("/jobs/{job_id}/stream")
 async def stream_job_status(job_id: str) -> StreamingResponse:
     """Stream job status updates via SSE (Fase 2 Iterasi 2.2). Closes on completed/failed."""
-    if not db.get_job(job_id):
+    if not await run_in_threadpool(db.get_job, job_id):
         raise HTTPException(status_code=404, detail="Job not found")
 
     async def gen() -> AsyncIterator[str]:
-        # ponytail: DB-poll-based SSE is intentional until Celery/RQ push queue exists;
-        # upgrade to event push when pipeline runs off-process.
         last_snapshot = ""
         ticks = 0
         while True:
             await asyncio.sleep(0.5)
             try:
-                payload = _build_status_payload(job_id)
+                payload = await run_in_threadpool(_build_status_payload, job_id)
             except HTTPException:
                 break
             snapshot = payload.model_dump_json(by_alias=True)
@@ -216,6 +265,7 @@ def download_clip(clip_id: str) -> FileResponse:
         path=file_path,
         media_type="video/mp4",
         filename=filename,
+        headers={"Cache-Control": "no-cache"},
     )
 
 
@@ -226,7 +276,9 @@ def download_clip_subtitles(clip_id: str) -> FileResponse:
     if not clip:
         raise HTTPException(status_code=404, detail="Clip not found")
 
-    subtitle_path = clip.get("subtitlePath") or clip.get("extra", {}).get("subtitlePath")
+    subtitle_path = clip.get("subtitlePath") or clip.get("extra", {}).get(
+        "subtitlePath"
+    )
     if not subtitle_path or not os.path.isfile(subtitle_path):
         file_path = clip.get("filePath")
         if file_path:
@@ -235,7 +287,9 @@ def download_clip_subtitles(clip_id: str) -> FileResponse:
                 subtitle_path = candidate
 
     if not subtitle_path or not os.path.isfile(subtitle_path):
-        raise HTTPException(status_code=404, detail="Subtitle file not found for this clip")
+        raise HTTPException(
+            status_code=404, detail="Subtitle file not found for this clip"
+        )
 
     return FileResponse(
         path=subtitle_path,
@@ -245,36 +299,60 @@ def download_clip_subtitles(clip_id: str) -> FileResponse:
 
 
 @router.get("/jobs/{job_id}/download-all")
-def download_all_clips(job_id: str) -> Response:
-    """Download all rendered clips of a job as one .zip (Fase 4 Iterasi 4.3)."""
+def download_all_clips(job_id: str) -> StreamingResponse:
+    """Download all rendered clips of a job as one .zip (spooled to disk to prevent OOM)."""
     job = db.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     if not job.clips:
         raise HTTPException(status_code=404, detail="No clips available for this job")
 
-    # On-demand fresh ZIP each request (no cache file); missing files skipped.
-    buf = io.BytesIO()
+    spool = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
     added = 0
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for clip in job.clips:
-            file_path = clip.get("filePath")
-            if not file_path or not os.path.isfile(file_path):
-                continue
-            fmt = str(clip.get("format", "")).replace(":", "x")
-            entry_name = f"clip-{clip.get('id')}-{fmt}.mp4"
-            zf.write(file_path, arcname=entry_name)
-            added += 1
+    try:
+        with zipfile.ZipFile(spool, "w", compression=zipfile.ZIP_STORED) as zf:
+            for clip in job.clips:
+                file_path = clip.get("filePath")
+                if not file_path or not os.path.isfile(file_path):
+                    continue
+                fmt = str(clip.get("format", "")).replace(":", "x")
+                entry_name = f"clip-{clip.get('id')}-{fmt}.mp4"
+                zf.write(
+                    file_path, arcname=entry_name, compress_type=zipfile.ZIP_STORED
+                )
+                added += 1
 
-            sub_path = clip.get("subtitlePath") or (os.path.splitext(file_path)[0] + ".srt" if file_path else None)
-            if sub_path and os.path.isfile(sub_path):
-                zf.write(sub_path, arcname=f"clip-{clip.get('id')}-{fmt}.srt")
+                sub_path = clip.get("subtitlePath") or (
+                    os.path.splitext(file_path)[0] + ".srt" if file_path else None
+                )
+                if sub_path and os.path.isfile(sub_path):
+                    zf.write(
+                        sub_path,
+                        arcname=f"clip-{clip.get('id')}-{fmt}.srt",
+                        compress_type=zipfile.ZIP_DEFLATED,
+                    )
+    except Exception:
+        spool.close()
+        raise
 
     if added == 0:
+        spool.close()
         raise HTTPException(status_code=404, detail="No clip files found on disk")
 
-    return Response(
-        content=buf.getvalue(),
+    spool.seek(0)
+
+    def _iter_spool() -> Iterator[bytes]:
+        try:
+            while True:
+                chunk = spool.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            spool.close()
+
+    return StreamingResponse(
+        _iter_spool(),
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="clips-{job_id}.zip"'},
     )

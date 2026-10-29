@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 from backend.core.cleanup import safe_within
 from backend.models.db import db
+from backend.pipeline.editor_export import export_manager, render_thumbnail_png
 from backend.pipeline.project_schema import (
     ProjectValidationError,
     build_default_project,
@@ -357,3 +358,83 @@ def list_projects(
     total = len(items)
     start = (page - 1) * pageSize
     return {"total": total, "items": items[start : start + pageSize]}
+
+
+class ThumbnailRequest(BaseModel):
+    time: float = 0.0
+    includeTitles: bool = True
+
+
+@router.post("/clips/{clip_id}/export")
+def start_clip_export(clip_id: str) -> dict[str, Any]:
+    ctx = resolve_clip_context(clip_id)
+    project, _ = _ensure_project_initialized(clip_id, ctx)
+    try:
+        cleaned = validate_project(
+            project,
+            master_duration=ctx["master_duration"],
+            clip_dir=ctx["clip_dir"],
+        )
+    except ProjectValidationError as exc:
+        raise HTTPException(status_code=422, detail=f"{exc.field}: {exc.message}")
+
+    try:
+        export_id = export_manager.start_export(clip_id, ctx, cleaned)
+    except RuntimeError as exc:
+        if "CONFLICT_ACTIVE_EXPORT" in str(exc):
+            raise HTTPException(
+                status_code=409, detail="Ekspor sedang berjalan untuk klip ini."
+            )
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"exportId": export_id}
+
+
+@router.get("/clips/{clip_id}/export/{export_id}")
+def get_clip_export_status(clip_id: str, export_id: str) -> dict[str, Any]:
+    st = export_manager.get_status(clip_id, export_id)
+    if not st:
+        raise HTTPException(status_code=404, detail="Status ekspor tidak ditemukan.")
+    return st
+
+
+@router.get("/clips/{clip_id}/versions")
+def get_clip_versions(clip_id: str) -> dict[str, Any]:
+    ctx = resolve_clip_context(clip_id)
+    return export_manager.list_versions(clip_id, ctx)
+
+
+@router.post("/clips/{clip_id}/versions/{version_num}/restore")
+def restore_clip_version(clip_id: str, version_num: int) -> dict[str, Any]:
+    ctx = resolve_clip_context(clip_id)
+    try:
+        return export_manager.restore_version(clip_id, ctx, version_num)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+
+
+@router.post("/clips/{clip_id}/thumbnail")
+def generate_clip_thumbnail(clip_id: str, body: ThumbnailRequest) -> FileResponse:
+    ctx = resolve_clip_context(clip_id)
+    if body.time < 0 or body.time > ctx["master_duration"] + 0.05:
+        raise HTTPException(
+            status_code=422, detail="time: berada di luar durasi master."
+        )
+    project, _ = _ensure_project_initialized(clip_id, ctx)
+    out_png = os.path.join(ctx["clip_dir"], "versions", "thumbnail_cover.png")
+    try:
+        render_thumbnail_png(
+            source_path=ctx["source_path"],
+            project=project,
+            clip_dir=ctx["clip_dir"],
+            out_png_path=out_png,
+            time_sec=min(body.time, ctx["master_duration"]),
+            include_titles=body.includeTitles,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+    return FileResponse(
+        path=out_png,
+        media_type="image/png",
+        filename=f"thumbnail-{clip_id[:8]}.png",
+        headers={"Cache-Control": "no-cache"},
+    )
